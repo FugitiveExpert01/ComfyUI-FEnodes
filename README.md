@@ -102,4 +102,4 @@ Pull requests are welcome. If you're adding a node, please:
 
 ## 📄 License
 
-MIT License — free to use in personal and commercial VFX pipelines.
+Apache License 2.0 — free to use in personal and commercial VFX pipelines.
