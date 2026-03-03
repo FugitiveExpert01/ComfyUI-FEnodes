@@ -52,9 +52,6 @@ TileSplit outputs a list of tile sequences so each tile can be routed through a 
 
 This repo is actively developed alongside VFX production work.
 
-NodeDescriptionStatusTileSplitGrid tile splitting for video batches✅ ReleasedTileMergeLaplacian pyramid tile reconstruction✅ ReleasedOptical Flow WarpFrame-to-frame warping for temporal consistency🔧 PlannedDepth-Guided CompositeLayer compositing driven by estimated depth maps🔧 PlannedMulti-pass DenoiseFrequency-separated denoising for fine/coarse detail🔧 PlannedTemporal BlendBlending across frame windows to reduce flicker🔧 PlannedMatte OperationsErode, dilate, blur, and combine alpha mattes🔧 PlannedColor Space Utilitieslinear/log/sRGB conversions for VFX-accurate colour🔧 Planned
-Have a node idea or a production use case that isn't covered? Open an issue.
-
 🤝 Contributing
 Pull requests are welcome. If you're adding a node, please:
 
