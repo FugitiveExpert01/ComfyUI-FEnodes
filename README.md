@@ -82,9 +82,11 @@ Load Image/Video → TileSplit → [Video Model / K-Sampler per tile] → TileMe
 > This repo is actively developed alongside VFX production work.
 
 | Node | Description | Status |
-|---|---|---|
+| --- | --- | --- |
 | **TileSplit** | Grid tile splitting for video batches | ✅ Released |
 | **TileMerge** | Laplacian pyramid tile reconstruction | ✅ Released |
+| **Text List → Batch** | Convert text lists to batched string inputs | ✅ Released |
+| **Text Batch → List** | Convert batched strings back to lists | ✅ Released |
 
 Have a node idea or a production use case that isn't covered? **[Open an issue](https://github.com/FugitiveExpert01/comfyui-vfx-nodes/issues).**
 
