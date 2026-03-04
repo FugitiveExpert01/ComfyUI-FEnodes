@@ -70,7 +70,7 @@ Nodes will appear in the node menu. No additional dependencies beyond what Comfy
 ## 🎬 Typical Workflow
 
 ```
-Load Video → TileSplit → [Video Model / K-Sampler per tile] → TileMerge → Save Video
+Load Image/Video → TileSplit → [Video Model / K-Sampler per tile] → TileMerge → Save Image/Video
 ```
 
 `TileSplit` outputs a list of tile sequences so each tile can be routed through a video model independently, then `TileMerge` reconstructs the full frame. This allows processing of resolutions that would otherwise exceed VRAM limits.
