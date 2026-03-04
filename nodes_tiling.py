@@ -34,6 +34,8 @@ class TilingNodeBase:
       frames, avoiding redundant work proportional to frame count.
     """
 
+    BLEND_MODES = ["laplacian", "linear"]
+
     # ------------------------------------------------------------------
     # Tensor normalisation
     # ------------------------------------------------------------------
@@ -300,19 +302,21 @@ class TileSplit(TilingNodeBase):
 
 class TileMerge(TilingNodeBase):
     """
-    Merges processed tiles back into a full image or video sequence using
-    multi-band (Laplacian pyramid) blending.
+    Merges processed tiles back into a full image or video sequence.
 
-    Each frequency band is blended independently:
-      - Coarse bands  → wide feather transition (hides colour/tone shifts)
-      - Fine bands    → narrow transition (preserves sharp detail at seams)
+    Two blending modes are available via the blend_mode dropdown:
 
-    This avoids the classic conflict between 'wide feather blurs detail' and
-    'narrow feather leaves visible seams'.
+    laplacian — Multi-band blending using a Laplacian pyramid.
+      Each frequency band is blended independently so coarse bands
+      (colour, tone) transition smoothly over a wide zone while fine
+      detail bands transition sharply. Eliminates the classic trade-off
+      where wide feathering blurs detail and narrow feathering leaves
+      visible seams. Best quality; recommended for final output.
 
-    Video optimisation: blending mask pyramids are computed once from the
-    first frame and reused for all subsequent frames, since tile layout is
-    constant across the video.
+    linear — Simple Gaussian-feathered weighted average.
+      Fast and straightforward. Overlap regions are cross-faded with a
+      linear ramp. Good for quick previews or when tile content is very
+      similar and seams are not an issue.
     """
 
     PYRAMID_LEVELS = 4   # depth of Laplacian decomposition; 4 is standard
@@ -321,8 +325,9 @@ class TileMerge(TilingNodeBase):
     def INPUT_TYPES(s):
         return {
             "required": {
-                "tiles":     ("IMAGE",),
-                "tile_calc": ("TILE_CALC",),
+                "tiles":      ("IMAGE",),
+                "tile_calc":  ("TILE_CALC",),
+                "blend_mode": (TilingNodeBase.BLEND_MODES, {"default": "laplacian"}),
             }
         }
 
@@ -331,12 +336,13 @@ class TileMerge(TilingNodeBase):
     FUNCTION       = "merge"
     CATEGORY       = "FEnodes"
 
-    def merge(self, tiles, tile_calc):
-        tc     = tile_calc[0]
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        levels = self.PYRAMID_LEVELS
-        orig_h = tc['orig_h']
-        orig_w = tc['orig_w']
+    def merge(self, tiles, tile_calc, blend_mode):
+        tc         = tile_calc[0]
+        # blend_mode arrives as a list because INPUT_IS_LIST = True
+        blend_mode = blend_mode[0] if isinstance(blend_mode, list) else blend_mode
+        device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        orig_h     = tc['orig_h']
+        orig_w     = tc['orig_w']
 
         # Unwrap any extra list nesting ComfyUI may add
         tile_list = tiles
@@ -347,32 +353,46 @@ class TileMerge(TilingNodeBase):
 
         num_frames = tile_list[0].shape[0]
         log.info(
-            "TileMerge: %d tiles × %d frames — Laplacian pyramid blend "
-            "(%d levels) → %dx%d canvas",
-            len(tile_list), num_frames, levels, orig_w, orig_h,
+            "TileMerge: %d tiles × %d frames — %s blend → %dx%d canvas",
+            len(tile_list), num_frames, blend_mode, orig_w, orig_h,
         )
         for idx, t in enumerate(tile_list):
             log.debug("TileMerge: tile[%d] shape=%s dtype=%s", idx, t.shape, t.dtype)
 
-        # Canvas size at each pyramid level
-        canvas_sizes = self._canvas_pyramid_sizes(orig_h, orig_w, levels)
-        log.debug("TileMerge: canvas pyramid sizes %s", canvas_sizes)
+        if blend_mode == "laplacian":
+            result = self._merge_laplacian(tile_list, tc, device, orig_h, orig_w)
+        else:
+            result = self._merge_linear(tile_list, tc, device, orig_h, orig_w)
 
-        # ------------------------------------------------------------------
-        # Pre-compute mask pyramids (VIDEO OPTIMISATION)
-        # Masks depend only on tile layout, not pixel content.
-        # Computed once from the first frame; reused for every subsequent frame.
-        # ------------------------------------------------------------------
-        log.info("TileMerge: pre-computing mask pyramids for %d tiles", len(tc['layouts']))
+        log.info("TileMerge: done — output shape=%s", result.shape)
+        return (result,)
+
+    # ------------------------------------------------------------------
+    # Laplacian pyramid blending
+    # ------------------------------------------------------------------
+
+    def _merge_laplacian(self, tile_list, tc, device, orig_h, orig_w):
+        """
+        Multi-band blend: each Laplacian pyramid level is accumulated
+        separately and the final image is collapsed from the blended pyramid.
+
+        Mask pyramids are pre-computed once and reused across all frames
+        (video optimisation — masks depend on layout, not pixel content).
+        """
+        levels       = self.PYRAMID_LEVELS
+        canvas_sizes = self._canvas_pyramid_sizes(orig_h, orig_w, levels)
+        log.debug("TileMerge [laplacian]: canvas pyramid sizes %s", canvas_sizes)
+
+        # Pre-compute mask pyramids
+        log.info("TileMerge [laplacian]: pre-computing mask pyramids for %d tiles",
+                 len(tc['layouts']))
         mask_pyramids     = []
         cached_tile_sizes = []
 
         for i, layout in enumerate(tc['layouts']):
-            raw_first = tile_list[i][0]
-            tf_first  = self.ensure_4d_BCHW(raw_first, device)
-            th, tw    = tf_first.shape[2], tf_first.shape[3]
+            tf_first = self.ensure_4d_BCHW(tile_list[i][0], device)
+            th, tw   = tf_first.shape[2], tf_first.shape[3]
             cached_tile_sizes.append((th, tw))
-
             mask = self.create_gaussian_mask(
                 th, tw,
                 layout['ov_t'], layout['ov_b'],
@@ -380,15 +400,11 @@ class TileMerge(TilingNodeBase):
                 device,
             )
             mask_pyramids.append(self._build_gaussian_pyramid(mask, levels))
-            log.debug("TileMerge: mask pyramid %d — base %dx%d", i, tw, th)
+            log.debug("TileMerge [laplacian]: mask pyramid %d base %dx%d", i, tw, th)
 
-        # ------------------------------------------------------------------
-        # Per-frame Laplacian pyramid blending
-        # ------------------------------------------------------------------
         output_frames = []
 
-        for b in range(num_frames):
-            # Accumulator pyramids — one accumulator + one weight per level
+        for b in range(tc['batch_size'] if 'batch_size' in tc else tile_list[0].shape[0]):
             accum  = [torch.zeros((1, 3, h, w), device=device, dtype=torch.float32)
                       for h, w in canvas_sizes]
             weight = [torch.zeros((1, 1, h, w), device=device, dtype=torch.float32)
@@ -396,13 +412,12 @@ class TileMerge(TilingNodeBase):
 
             for i, layout in enumerate(tc['layouts']):
                 raw_frame  = tile_list[i][b]
-                log.debug("TileMerge: frame %d tile %d raw shape=%s", b, i, raw_frame.shape)
-
                 tile_frame = self.ensure_4d_BCHW(raw_frame, device)
                 th, tw     = tile_frame.shape[2], tile_frame.shape[3]
-                log.debug("TileMerge: frame %d tile %d normalised shape=%s", b, i, tile_frame.shape)
 
-                # Warn and rebuild mask if tile size changed between frames
+                log.debug("TileMerge [laplacian]: frame %d tile %d shape=%s", b, i, tile_frame.shape)
+
+                # Rebuild mask pyramid if tile size changed (e.g. model resized it)
                 if (th, tw) != cached_tile_sizes[i]:
                     log.warning(
                         "TileMerge: tile %d changed size at frame %d "
@@ -419,23 +434,16 @@ class TileMerge(TilingNodeBase):
                 else:
                     tile_mask_pyr = mask_pyramids[i]
 
-                # Laplacian pyramid for this tile frame
                 tile_pyr = self._build_laplacian_pyramid(tile_frame, levels)
 
-                # Accumulate each level into the canvas accumulators
                 for l in range(levels):
-                    # Scale tile origin to this pyramid level.
-                    # Right-shift == floor(x / 2^l), matching F.interpolate behaviour.
+                    # Scale tile origin to this pyramid level via right-shift
+                    # (floor division by 2^l, matching F.interpolate behaviour)
                     x_l = layout['x'] >> l
                     y_l = layout['y'] >> l
-
                     canvas_h, canvas_w = canvas_sizes[l]
-                    lvl_h = tile_pyr[l].shape[2]
-                    lvl_w = tile_pyr[l].shape[3]
-
-                    # Clamp to canvas boundary (handles edge tiles)
-                    h_sl = min(lvl_h, canvas_h - y_l)
-                    w_sl = min(lvl_w, canvas_w - x_l)
+                    h_sl = min(tile_pyr[l].shape[2], canvas_h - y_l)
+                    w_sl = min(tile_pyr[l].shape[3], canvas_w - x_l)
 
                     if h_sl <= 0 or w_sl <= 0:
                         log.debug("TileMerge: tile %d level %d out of canvas — skipping", i, l)
@@ -445,14 +453,49 @@ class TileMerge(TilingNodeBase):
                     accum [l][:, :, y_l:y_l+h_sl, x_l:x_l+w_sl] += tile_pyr[l][:, :, :h_sl, :w_sl] * m
                     weight[l][:, :, y_l:y_l+h_sl, x_l:x_l+w_sl] += m
 
-            # Normalise then collapse pyramid back to full resolution
             blended_pyr = [accum[l] / (weight[l] + 1e-8) for l in range(levels)]
             frame_out   = self._collapse_pyramid(blended_pyr)
             output_frames.append(frame_out.permute(0, 2, 3, 1).cpu())
 
-        result = torch.cat(output_frames, dim=0).clamp(0, 1)
-        log.info("TileMerge: done — output shape=%s", result.shape)
-        return (result,)
+        return torch.cat(output_frames, dim=0).clamp(0, 1)
+
+    # ------------------------------------------------------------------
+    # Linear (Gaussian feather) blending
+    # ------------------------------------------------------------------
+
+    def _merge_linear(self, tile_list, tc, device, orig_h, orig_w):
+        """
+        Simple weighted-average blend using a linear feathering mask.
+        Fast; good for previews or low-overlap grids.
+        """
+        output_frames = []
+
+        for b in range(tile_list[0].shape[0]):
+            accum  = torch.zeros((1, 3, orig_h, orig_w), device=device, dtype=torch.float32)
+            weight = torch.zeros((1, 1, orig_h, orig_w), device=device, dtype=torch.float32)
+
+            for i, layout in enumerate(tc['layouts']):
+                tile_frame = self.ensure_4d_BCHW(tile_list[i][b], device)
+                th, tw     = tile_frame.shape[2], tile_frame.shape[3]
+                log.debug("TileMerge [linear]: frame %d tile %d shape=%s", b, i, tile_frame.shape)
+
+                mask = self.create_gaussian_mask(
+                    th, tw,
+                    layout['ov_t'], layout['ov_b'],
+                    layout['ov_l'], layout['ov_r'],
+                    device,
+                )
+
+                x, y = layout['x'], layout['y']
+                h_sl = min(th, orig_h - y)
+                w_sl = min(tw, orig_w - x)
+
+                accum [:, :, y:y+h_sl, x:x+w_sl] += tile_frame[:, :, :h_sl, :w_sl] * mask[:, :, :h_sl, :w_sl]
+                weight[:, :, y:y+h_sl, x:x+w_sl] += mask[:, :, :h_sl, :w_sl]
+
+            output_frames.append((accum / (weight + 1e-8)).permute(0, 2, 3, 1).cpu())
+
+        return torch.cat(output_frames, dim=0).clamp(0, 1)
 
 
 # ======================================================================
