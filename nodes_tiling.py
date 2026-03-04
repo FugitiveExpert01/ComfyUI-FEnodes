@@ -3,10 +3,13 @@ FEnodes — Tiling nodes for VFX production pipelines.
 Author: FugitiveExpert01
 """
 
+import logging
 import torch
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+log = logging.getLogger(__name__)
 
 
 class TilingNodeBase:
@@ -21,28 +24,34 @@ class TilingNodeBase:
         t = t.to(device=device, dtype=torch.float32)
         if t.dim() == 2:
             # (H, W) — greyscale, add batch + channel
+            log.debug("ensure_4d_BCHW: 2D greyscale input %s, expanding to (1, 1, H, W)", t.shape)
             t = t.unsqueeze(0).unsqueeze(0)          # (1, 1, H, W)
         elif t.dim() == 3:
             # Could be (H, W, C) channels-last or (C, H, W) channels-first
             # ComfyUI convention is always channels-last, so treat as (H, W, C)
+            log.debug("ensure_4d_BCHW: 3D input %s, treating as (H, W, C)", t.shape)
             t = t.unsqueeze(0)                        # (1, H, W, C)
             t = t.permute(0, 3, 1, 2)                # (1, C, H, W)
         elif t.dim() == 4:
             # Could be (1, H, W, C) or (1, C, H, W)
             # If the last dim looks like a channel count it's channels-last
             if t.shape[-1] in (1, 3, 4):
+                log.debug("ensure_4d_BCHW: 4D channels-last input %s, permuting to (B, C, H, W)", t.shape)
                 t = t.permute(0, 3, 1, 2)            # (1, C, H, W)
-            # else already (1, C, H, W)
+            else:
+                log.debug("ensure_4d_BCHW: 4D input %s already in (B, C, H, W)", t.shape)
         else:
-            raise ValueError(f"[TileMerge] ensure_4d_BCHW: unexpected shape {t.shape}")
+            raise ValueError(f"[FEnodes] ensure_4d_BCHW: unexpected tensor shape {t.shape}")
 
-        assert t.dim() == 4, f"[TileMerge] ensure_4d_BCHW failed, result shape: {t.shape}"
+        if t.dim() != 4:
+            raise RuntimeError(f"[FEnodes] ensure_4d_BCHW failed — result shape: {t.shape}")
         return t.contiguous()
 
     @staticmethod
     def get_pyramid(img, levels=4):
         """img must be (1, C, H, W)."""
-        assert img.dim() == 4, f"get_pyramid expects 4D tensor, got {img.shape}"
+        if img.dim() != 4:
+            raise ValueError(f"[FEnodes] get_pyramid expects 4D tensor, got {img.shape}")
         pyramid = []
         current = img
         for i in range(levels - 1):
@@ -97,6 +106,9 @@ class TileSplit(TilingNodeBase):
         start_x = np.linspace(0, W - tile_w, tiles_x, dtype=int) if tiles_x > 1 else [0]
         start_y = np.linspace(0, H - tile_h, tiles_y, dtype=int) if tiles_y > 1 else [0]
 
+        log.info("TileSplit: input %dx%d px, %d frames — splitting into %dx%d tiles (%dx%d px each)",
+                 W, H, B, tiles_x, tiles_y, tile_w, tile_h)
+
         img_tensor = image.permute(0, 3, 1, 2).to(device)
         num_tiles = tiles_x * tiles_y
         tile_sequences = [[] for _ in range(num_tiles)]
@@ -109,6 +121,7 @@ class TileSplit(TilingNodeBase):
         try:
             font = ImageFont.truetype("LiberationSans-Bold.ttf", int(tile_h * 0.15))
         except Exception:
+            log.debug("TileSplit: LiberationSans-Bold.ttf not found, falling back to default font")
             font = ImageFont.load_default()
 
         for b in range(B):
@@ -129,6 +142,11 @@ class TileSplit(TilingNodeBase):
                             "ov_l": int(tile_w - ov_l) if x_idx > 0 else 0, "ov_r": int(ov_r),
                             "ov_t": int(tile_h - ov_t) if y_idx > 0 else 0, "ov_b": int(ov_b)
                         })
+                        log.debug("TileSplit: tile %d at (%d, %d), overlaps L=%d R=%d T=%d B=%d",
+                                  tile_count, x, y,
+                                  tile_layouts[-1]['ov_l'], tile_layouts[-1]['ov_r'],
+                                  tile_layouts[-1]['ov_t'], tile_layouts[-1]['ov_b'])
+
                         color = ((x_idx * 40) % 255, (y_idx * 60) % 255, 255, 100)
                         draw.rectangle([x, y, x + tile_w, y + tile_h], outline="white", fill=color, width=2)
                         draw.text((x + 10, y + 10), f"Tile {tile_count}", fill="white", font=font)
@@ -144,6 +162,7 @@ class TileSplit(TilingNodeBase):
             "layouts": tile_layouts
         }
 
+        log.info("TileSplit: done — produced %d tile sequences", num_tiles)
         return (final_tile_batches, debug_out, tile_calc)
 
 
@@ -173,12 +192,12 @@ class TileMerge(TilingNodeBase):
         while isinstance(tile_list, list) and len(tile_list) == 1 and isinstance(tile_list[0], list):
             tile_list = tile_list[0]
 
-        print(f"[FEnodes/TileMerge] number of tiles received: {len(tile_list)}")
-        for idx, t in enumerate(tile_list):
-            print(f"[FEnodes/TileMerge]   tile[{idx}] shape={t.shape} dtype={t.dtype}")
-
         num_frames = tile_list[0].shape[0]
-        print(f"[FEnodes/TileMerge] num_frames={num_frames}  canvas={tc['orig_h']}x{tc['orig_w']}")
+        log.info("TileMerge: %d tiles, %d frames — reconstructing %dx%d canvas",
+                 len(tile_list), num_frames, tc['orig_w'], tc['orig_h'])
+
+        for idx, t in enumerate(tile_list):
+            log.debug("TileMerge: tile[%d] shape=%s dtype=%s", idx, t.shape, t.dtype)
 
         output_frames = []
 
@@ -188,10 +207,10 @@ class TileMerge(TilingNodeBase):
 
             for i, layout in enumerate(tc['layouts']):
                 raw_frame  = tile_list[i][b]
-                print(f"[FEnodes/TileMerge]   frame b={b} tile={i} raw shape={raw_frame.shape}")
+                log.debug("TileMerge: frame %d tile %d — raw shape=%s", b, i, raw_frame.shape)
 
                 tile_frame = self.ensure_4d_BCHW(raw_frame, device)
-                print(f"[FEnodes/TileMerge]   frame b={b} tile={i} after ensure_4d shape={tile_frame.shape}")
+                log.debug("TileMerge: frame %d tile %d — after ensure_4d shape=%s", b, i, tile_frame.shape)
 
                 pyramid = self.get_pyramid(tile_frame, levels)
                 current_recon = pyramid[-1]
@@ -217,6 +236,7 @@ class TileMerge(TilingNodeBase):
 
             output_frames.append((accum / (weight + 1e-8)).permute(0, 2, 3, 1).cpu())
 
+        log.info("TileMerge: done — output shape=%s", torch.cat(output_frames, dim=0).shape)
         return (torch.cat(output_frames, dim=0).clamp(0, 1),)
 
 
