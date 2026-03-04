@@ -13,7 +13,30 @@ log = logging.getLogger(__name__)
 
 
 class TilingNodeBase:
-    """Base utility for Gaussian-weighted tile blending and grid math."""
+    """
+    Base class providing Laplacian pyramid blending utilities.
+
+    How multi-band blending works:
+      Each tile is decomposed into a Laplacian pyramid (detail at each frequency
+      band + a coarse residual). The blending mask is simultaneously downsampled
+      into a Gaussian pyramid. Each frequency band is blended independently using
+      its corresponding mask level — coarse bands blend over a wide transition
+      zone, fine detail bands blend over a narrow one. The blended pyramid is
+      then collapsed back into the final image.
+
+      This eliminates the classic trade-off of simple alpha blending: wide feather
+      radii smear fine detail, narrow ones leave visible seams. Multi-band blending
+      avoids both artefacts simultaneously.
+
+    Video optimisation:
+      Mask pyramids depend only on tile layout, not on pixel content. They are
+      pre-computed once from the first frame and reused across all subsequent
+      frames, avoiding redundant work proportional to frame count.
+    """
+
+    # ------------------------------------------------------------------
+    # Tensor normalisation
+    # ------------------------------------------------------------------
 
     @staticmethod
     def ensure_4d_BCHW(t, device):
@@ -23,117 +46,197 @@ class TilingNodeBase:
         """
         t = t.to(device=device, dtype=torch.float32)
         if t.dim() == 2:
-            # (H, W) — greyscale, add batch + channel
-            log.debug("ensure_4d_BCHW: 2D greyscale input %s, expanding to (1, 1, H, W)", t.shape)
-            t = t.unsqueeze(0).unsqueeze(0)          # (1, 1, H, W)
+            log.debug("ensure_4d_BCHW: 2D greyscale %s → (1, 1, H, W)", t.shape)
+            t = t.unsqueeze(0).unsqueeze(0)
         elif t.dim() == 3:
-            # Could be (H, W, C) channels-last or (C, H, W) channels-first
-            # ComfyUI convention is always channels-last, so treat as (H, W, C)
-            log.debug("ensure_4d_BCHW: 3D input %s, treating as (H, W, C)", t.shape)
-            t = t.unsqueeze(0)                        # (1, H, W, C)
-            t = t.permute(0, 3, 1, 2)                # (1, C, H, W)
+            log.debug("ensure_4d_BCHW: 3D %s → treating as (H, W, C)", t.shape)
+            t = t.unsqueeze(0).permute(0, 3, 1, 2)
         elif t.dim() == 4:
-            # Could be (1, H, W, C) or (1, C, H, W)
-            # If the last dim looks like a channel count it's channels-last
             if t.shape[-1] in (1, 3, 4):
-                log.debug("ensure_4d_BCHW: 4D channels-last input %s, permuting to (B, C, H, W)", t.shape)
-                t = t.permute(0, 3, 1, 2)            # (1, C, H, W)
+                log.debug("ensure_4d_BCHW: 4D channels-last %s → (B, C, H, W)", t.shape)
+                t = t.permute(0, 3, 1, 2)
             else:
-                log.debug("ensure_4d_BCHW: 4D input %s already in (B, C, H, W)", t.shape)
+                log.debug("ensure_4d_BCHW: 4D %s already (B, C, H, W)", t.shape)
         else:
-            raise ValueError(f"[FEnodes] ensure_4d_BCHW: unexpected tensor shape {t.shape}")
+            raise ValueError(f"[FEnodes] ensure_4d_BCHW: unexpected shape {t.shape}")
 
         if t.dim() != 4:
             raise RuntimeError(f"[FEnodes] ensure_4d_BCHW failed — result shape: {t.shape}")
         return t.contiguous()
 
+    # ------------------------------------------------------------------
+    # Pyramid construction
+    # ------------------------------------------------------------------
+
     @staticmethod
-    def create_gaussian_mask(h, w, overlap_top, overlap_bottom, overlap_left, overlap_right, device):
+    def _build_laplacian_pyramid(img, levels):
         """
-        Creates a feathering mask that linearly ramps to zero at overlap edges.
-        Tiles are blended by weighted-average accumulation using these masks.
+        Build a Laplacian pyramid from a (1, C, H, W) tensor.
+
+        Returns a list of `levels` tensors:
+          indices 0 … levels-2 : Laplacian detail planes, finest → coarsest
+          index   levels-1     : coarsest Gaussian residual
+
+        This is a pure-PyTorch, GPU-resident operation.
+        """
+        pyramid = []
+        current = img
+        for _ in range(levels - 1):
+            h, w = current.shape[2], current.shape[3]
+            down = F.interpolate(current, scale_factor=0.5,
+                                 mode='bilinear', align_corners=False)
+            up   = F.interpolate(down, size=(h, w),
+                                 mode='bilinear', align_corners=False)
+            pyramid.append(current - up)   # detail = original − low-pass
+            current = down
+        pyramid.append(current)            # coarsest Gaussian residual
+        return pyramid
+
+    @staticmethod
+    def _build_gaussian_pyramid(mask, levels):
+        """
+        Build a Gaussian pyramid for a (1, 1, H, W) blending mask.
+
+        Returns `levels` tensors from finest to coarsest.  Downsampling the
+        mask means low-frequency pyramid bands blend over a proportionally
+        wider spatial transition than high-frequency bands — the core benefit
+        of multi-band blending.
+        """
+        pyramid = [mask]
+        current = mask
+        for _ in range(levels - 1):
+            current = F.interpolate(current, scale_factor=0.5,
+                                    mode='bilinear', align_corners=False)
+            pyramid.append(current)
+        return pyramid
+
+    @staticmethod
+    def _collapse_pyramid(pyramid):
+        """
+        Reconstruct a (1, C, H, W) image from a blended Laplacian pyramid.
+
+        pyramid: list of tensors, finest detail first, coarsest Gaussian last.
+        """
+        result = pyramid[-1]
+        for level in reversed(pyramid[:-1]):
+            h, w = level.shape[2], level.shape[3]
+            result = F.interpolate(result, size=(h, w),
+                                   mode='bilinear', align_corners=False)
+            result = result + level
+        return result
+
+    @staticmethod
+    def _canvas_pyramid_sizes(orig_h, orig_w, levels):
+        """
+        Compute canvas (H, W) at each pyramid level.
+
+        Uses the same floor-division that F.interpolate(scale_factor=0.5)
+        applies internally, so canvas and tile pyramids stay aligned.
+        """
+        sizes = []
+        h, w = orig_h, orig_w
+        for _ in range(levels):
+            sizes.append((h, w))
+            h = h // 2
+            w = w // 2
+        return sizes
+
+    # ------------------------------------------------------------------
+    # Blending mask
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def create_gaussian_mask(h, w, overlap_top, overlap_bottom,
+                             overlap_left, overlap_right, device):
+        """
+        Linear feathering mask — ramps from 0 → 1 across each overlap edge.
+        Used as the level-0 mask; pyramid downsampling widens the ramp at
+        coarser levels automatically.
         """
         mask = torch.ones((1, 1, h, w), device=device)
         if overlap_top > 0:
-            mask[:, :, :overlap_top, :] *= torch.linspace(0, 1, overlap_top, device=device).view(1, 1, overlap_top, 1)
+            mask[:, :, :overlap_top, :] *= torch.linspace(
+                0, 1, overlap_top, device=device).view(1, 1, overlap_top, 1)
         if overlap_bottom > 0:
-            mask[:, :, -overlap_bottom:, :] *= torch.linspace(1, 0, overlap_bottom, device=device).view(1, 1, overlap_bottom, 1)
+            mask[:, :, -overlap_bottom:, :] *= torch.linspace(
+                1, 0, overlap_bottom, device=device).view(1, 1, overlap_bottom, 1)
         if overlap_left > 0:
-            mask[:, :, :, :overlap_left] *= torch.linspace(0, 1, overlap_left, device=device).view(1, 1, 1, overlap_left)
+            mask[:, :, :, :overlap_left] *= torch.linspace(
+                0, 1, overlap_left, device=device).view(1, 1, 1, overlap_left)
         if overlap_right > 0:
-            mask[:, :, :, -overlap_right:] *= torch.linspace(1, 0, overlap_right, device=device).view(1, 1, 1, overlap_right)
+            mask[:, :, :, -overlap_right:] *= torch.linspace(
+                1, 0, overlap_right, device=device).view(1, 1, 1, overlap_right)
         return mask
 
 
+# ======================================================================
+# TileSplit
+# ======================================================================
+
 class TileSplit(TilingNodeBase):
-    """Splits image or video batches into an overlapping grid of tiles."""
+    """Splits an image or video batch into an overlapping grid of tiles."""
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "image": ("IMAGE",),
-                "tiles_x": ("INT", {"default": 2, "min": 1, "max": 10}),
-                "tiles_y": ("INT", {"default": 2, "min": 1, "max": 10}),
+                "image":           ("IMAGE",),
+                "tiles_x":         ("INT",   {"default": 2,    "min": 1,   "max": 10}),
+                "tiles_y":         ("INT",   {"default": 2,    "min": 1,   "max": 10}),
                 "overlap_percent": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 0.5, "step": 0.01}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "TILE_CALC")
-    RETURN_NAMES = ("tiles", "debug_image", "tile_calc")
+    RETURN_TYPES  = ("IMAGE", "IMAGE", "TILE_CALC")
+    RETURN_NAMES  = ("tiles", "debug_image", "tile_calc")
     OUTPUT_IS_LIST = (True, False, False)
-    FUNCTION = "split"
-    CATEGORY = "FEnodes"
+    FUNCTION  = "split"
+    CATEGORY  = "FEnodes"
 
     def split(self, image, tiles_x, tiles_y, overlap_percent):
         B, H, W, C = image.shape
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Base tile size is the image divided evenly by tile count.
-        # overlap_percent extends each tile beyond its base size so adjacent
-        # tiles share pixels — this overlap is what gets feathered on merge.
+        # Base tile size = canvas divided evenly.
+        # overlap_percent extends each tile so adjacent tiles share pixels —
+        # those shared pixels are feathered during merge.
         base_tile_w = W / tiles_x
         base_tile_h = H / tiles_y
-        overlap_px_x = int(base_tile_w * overlap_percent)
-        overlap_px_y = int(base_tile_h * overlap_percent)
-        # Snap overlap to nearest multiple of 8 to keep tile dims model-friendly
-        overlap_px_x = (overlap_px_x // 8) * 8
-        overlap_px_y = (overlap_px_y // 8) * 8
+        overlap_px_x = (int(base_tile_w * overlap_percent) // 8) * 8
+        overlap_px_y = (int(base_tile_h * overlap_percent) // 8) * 8
 
-        tile_w = int(base_tile_w) + overlap_px_x
-        tile_h = int(base_tile_h) + overlap_px_y
-        # Round up to multiple of 8 and clamp to image size
-        tile_w = min(((tile_w + 7) // 8) * 8, W)
-        tile_h = min(((tile_h + 7) // 8) * 8, H)
+        tile_w = min(((int(base_tile_w) + overlap_px_x + 7) // 8) * 8, W)
+        tile_h = min(((int(base_tile_h) + overlap_px_y + 7) // 8) * 8, H)
 
-        # Space tile start positions evenly so they cover the full image
         start_x = np.linspace(0, W - tile_w, tiles_x, dtype=int) if tiles_x > 1 else [0]
         start_y = np.linspace(0, H - tile_h, tiles_y, dtype=int) if tiles_y > 1 else [0]
 
-        # Actual overlap in pixels after rounding (for logging)
         actual_ov_x = tile_w - int((W - tile_w) / max(tiles_x - 1, 1)) if tiles_x > 1 else 0
         actual_ov_y = tile_h - int((H - tile_h) / max(tiles_y - 1, 1)) if tiles_y > 1 else 0
 
         log.info(
-            "TileSplit: %dx%d px, %d frames — %dx%d grid, tile size %dx%d, overlap ~%dpx x %dpx (%.0f%% x %.0f%%)",
+            "TileSplit: %dx%d px, %d frames — %dx%d grid, "
+            "tile %dx%d px, overlap ~%d×%d px (%.0f%% × %.0f%%)",
             W, H, B, tiles_x, tiles_y, tile_w, tile_h,
             actual_ov_x, actual_ov_y,
             (actual_ov_x / tile_w) * 100, (actual_ov_y / tile_h) * 100,
         )
 
-        img_tensor = image.permute(0, 3, 1, 2).to(device)
-        num_tiles = tiles_x * tiles_y
+        img_tensor    = image.permute(0, 3, 1, 2).to(device)
+        num_tiles     = tiles_x * tiles_y
         tile_sequences = [[] for _ in range(num_tiles)]
-        tile_layouts = []
+        tile_layouts  = []
 
-        debug_pil = Image.fromarray((image[0].cpu().numpy() * 255).astype(np.uint8)).convert("RGBA")
-        overlay = Image.new("RGBA", debug_pil.size, (0, 0, 0, 120))
+        # Debug overlay
+        debug_pil = Image.fromarray(
+            (image[0].cpu().numpy() * 255).astype(np.uint8)).convert("RGBA")
+        overlay   = Image.new("RGBA", debug_pil.size, (0, 0, 0, 120))
         debug_pil = Image.alpha_composite(debug_pil, overlay)
-        draw = ImageDraw.Draw(debug_pil)
+        draw      = ImageDraw.Draw(debug_pil)
         try:
             font = ImageFont.truetype("LiberationSans-Bold.ttf", int(tile_h * 0.15))
         except Exception:
-            log.debug("TileSplit: LiberationSans-Bold.ttf not found, falling back to default font")
+            log.debug("TileSplit: LiberationSans-Bold.ttf not found, using default font")
             font = ImageFont.load_default()
 
         for b in range(B):
@@ -141,30 +244,34 @@ class TileSplit(TilingNodeBase):
             for y_idx, y in enumerate(start_y):
                 for x_idx, x in enumerate(start_x):
                     tile_frame = img_tensor[b:b+1, :, y:y+tile_h, x:x+tile_w]
-                    tile_sequences[tile_count].append(tile_frame.permute(0, 2, 3, 1).cpu())
+                    tile_sequences[tile_count].append(
+                        tile_frame.permute(0, 2, 3, 1).cpu())
 
                     if b == 0:
-                        # Overlap with the previous tile on each side
-                        ov_l = int(tile_w - (start_x[x_idx] - start_x[x_idx-1])) if x_idx > 0 else 0
-                        ov_r = int(tile_w - (start_x[x_idx+1] - start_x[x_idx])) if x_idx < tiles_x - 1 else 0
-                        ov_t = int(tile_h - (start_y[y_idx] - start_y[y_idx-1])) if y_idx > 0 else 0
-                        ov_b = int(tile_h - (start_y[y_idx+1] - start_y[y_idx])) if y_idx < tiles_y - 1 else 0
+                        ov_l = int(tile_w - (start_x[x_idx] - start_x[x_idx-1])) if x_idx > 0             else 0
+                        ov_r = int(tile_w - (start_x[x_idx+1] - start_x[x_idx])) if x_idx < tiles_x - 1  else 0
+                        ov_t = int(tile_h - (start_y[y_idx] - start_y[y_idx-1])) if y_idx > 0             else 0
+                        ov_b = int(tile_h - (start_y[y_idx+1] - start_y[y_idx])) if y_idx < tiles_y - 1  else 0
 
                         tile_layouts.append({
                             "x": int(x), "y": int(y),
                             "ov_l": ov_l, "ov_r": ov_r,
                             "ov_t": ov_t, "ov_b": ov_b,
                         })
-                        log.debug("TileSplit: tile %d at (%d, %d), overlaps L=%d R=%d T=%d B=%d",
+                        log.debug("TileSplit: tile %d at (%d,%d) overlaps L=%d R=%d T=%d B=%d",
                                   tile_count, x, y, ov_l, ov_r, ov_t, ov_b)
 
                         color = ((x_idx * 40) % 255, (y_idx * 60) % 255, 255, 100)
-                        draw.rectangle([x, y, x + tile_w, y + tile_h], outline="white", fill=color, width=2)
-                        draw.text((x + 10, y + 10), f"Tile {tile_count}", fill="white", font=font)
+                        draw.rectangle([x, y, x + tile_w, y + tile_h],
+                                       outline="white", fill=color, width=2)
+                        draw.text((x + 10, y + 10), f"Tile {tile_count}",
+                                  fill="white", font=font)
                     tile_count += 1
 
         final_tile_batches = [torch.cat(seq, dim=0) for seq in tile_sequences]
-        debug_out = torch.from_numpy(np.array(debug_pil.convert("RGB")).astype(np.float32) / 255.0).unsqueeze(0)
+        debug_out = torch.from_numpy(
+            np.array(debug_pil.convert("RGB")).astype(np.float32) / 255.0
+        ).unsqueeze(0)
         tile_calc = {
             "orig_w": W, "orig_h": H,
             "tile_w": tile_w, "tile_h": tile_h,
@@ -173,80 +280,174 @@ class TileSplit(TilingNodeBase):
             "layouts": tile_layouts,
         }
 
-        log.info("TileSplit: done — produced %d tile sequences", num_tiles)
+        log.info("TileSplit: done — %d tile sequences produced", num_tiles)
         return (final_tile_batches, debug_out, tile_calc)
 
 
+# ======================================================================
+# TileMerge
+# ======================================================================
+
 class TileMerge(TilingNodeBase):
     """
-    Merges processed tiles back into a full image or video sequence.
-    Blending is Gaussian-weighted: overlap regions are feathered linearly
-    and accumulated via weighted average, producing seamless seams.
+    Merges processed tiles back into a full image or video sequence using
+    multi-band (Laplacian pyramid) blending.
+
+    Each frequency band is blended independently:
+      - Coarse bands  → wide feather transition (hides colour/tone shifts)
+      - Fine bands    → narrow transition (preserves sharp detail at seams)
+
+    This avoids the classic conflict between 'wide feather blurs detail' and
+    'narrow feather leaves visible seams'.
+
+    Video optimisation: blending mask pyramids are computed once from the
+    first frame and reused for all subsequent frames, since tile layout is
+    constant across the video.
     """
+
+    PYRAMID_LEVELS = 4   # depth of Laplacian decomposition; 4 is standard
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "tiles": ("IMAGE",),
+                "tiles":     ("IMAGE",),
                 "tile_calc": ("TILE_CALC",),
             }
         }
 
-    INPUT_IS_LIST = True
-    RETURN_TYPES = ("IMAGE",)
-    FUNCTION = "merge"
-    CATEGORY = "FEnodes"
+    INPUT_IS_LIST  = True
+    RETURN_TYPES   = ("IMAGE",)
+    FUNCTION       = "merge"
+    CATEGORY       = "FEnodes"
 
     def merge(self, tiles, tile_calc):
-        tc = tile_calc[0]
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        tc      = tile_calc[0]
+        device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        levels  = self.PYRAMID_LEVELS
+        orig_h  = tc['orig_h']
+        orig_w  = tc['orig_w']
 
+        # Unwrap any extra list nesting ComfyUI may add
         tile_list = tiles
-        while isinstance(tile_list, list) and len(tile_list) == 1 and isinstance(tile_list[0], list):
+        while (isinstance(tile_list, list)
+               and len(tile_list) == 1
+               and isinstance(tile_list[0], list)):
             tile_list = tile_list[0]
 
         num_frames = tile_list[0].shape[0]
-        log.info("TileMerge: %d tiles, %d frames — reconstructing %dx%d canvas",
-                 len(tile_list), num_frames, tc['orig_w'], tc['orig_h'])
-
+        log.info(
+            "TileMerge: %d tiles × %d frames — Laplacian pyramid blend "
+            "(%d levels) → %dx%d canvas",
+            len(tile_list), num_frames, levels, orig_w, orig_h,
+        )
         for idx, t in enumerate(tile_list):
             log.debug("TileMerge: tile[%d] shape=%s dtype=%s", idx, t.shape, t.dtype)
 
+        # Canvas size at each pyramid level (used to allocate accumulators)
+        canvas_sizes = self._canvas_pyramid_sizes(orig_h, orig_w, levels)
+        log.debug("TileMerge: canvas pyramid sizes %s", canvas_sizes)
+
+        # ------------------------------------------------------------------
+        # Pre-compute mask pyramids (VIDEO OPTIMISATION)
+        # Masks depend only on tile layout, not pixel content.
+        # Computed once from the first frame; reused for every subsequent frame.
+        # ------------------------------------------------------------------
+        log.info("TileMerge: pre-computing mask pyramids for %d tiles", len(tc['layouts']))
+        mask_pyramids   = []      # mask_pyramids[tile_idx][level] → (1,1,H,W)
+        cached_tile_sizes = []    # record (H, W) so we can detect size changes
+
+        for i, layout in enumerate(tc['layouts']):
+            raw_first = tile_list[i][0]
+            tf_first  = self.ensure_4d_BCHW(raw_first, device)
+            th, tw    = tf_first.shape[2], tf_first.shape[3]
+            cached_tile_sizes.append((th, tw))
+
+            mask = self.create_gaussian_mask(
+                th, tw,
+                layout['ov_t'], layout['ov_b'],
+                layout['ov_l'], layout['ov_r'],
+                device,
+            )
+            mask_pyramids.append(self._build_gaussian_pyramid(mask, levels))
+            log.debug("TileMerge: mask pyramid %d — base %dx%d", i, tw, th)
+
+        # ------------------------------------------------------------------
+        # Per-frame Laplacian pyramid blending
+        # ------------------------------------------------------------------
         output_frames = []
 
         for b in range(num_frames):
-            accum  = torch.zeros((1, 3, tc['orig_h'], tc['orig_w']), device=device, dtype=torch.float32)
-            weight = torch.zeros((1, 1, tc['orig_h'], tc['orig_w']), device=device, dtype=torch.float32)
+            # Accumulator pyramids — one accumulator + one weight per level
+            accum  = [torch.zeros((1, 3, h, w), device=device, dtype=torch.float32)
+                      for h, w in canvas_sizes]
+            weight = [torch.zeros((1, 1, h, w), device=device, dtype=torch.float32)
+                      for h, w in canvas_sizes]
 
             for i, layout in enumerate(tc['layouts']):
-                raw_frame = tile_list[i][b]
-                log.debug("TileMerge: frame %d tile %d — raw shape=%s", b, i, raw_frame.shape)
+                raw_frame  = tile_list[i][b]
+                log.debug("TileMerge: frame %d tile %d raw shape=%s", b, i, raw_frame.shape)
 
                 tile_frame = self.ensure_4d_BCHW(raw_frame, device)
-                log.debug("TileMerge: frame %d tile %d — normalised shape=%s", b, i, tile_frame.shape)
+                th, tw     = tile_frame.shape[2], tile_frame.shape[3]
+                log.debug("TileMerge: frame %d tile %d normalised shape=%s", b, i, tile_frame.shape)
 
-                curr_h, curr_w = tile_frame.shape[2], tile_frame.shape[3]
-                mask = self.create_gaussian_mask(
-                    curr_h, curr_w,
-                    layout['ov_t'], layout['ov_b'],
-                    layout['ov_l'], layout['ov_r'],
-                    device
-                )
+                # Warn if tile size changed between frames (e.g. model resized it)
+                if (th, tw) != cached_tile_sizes[i]:
+                    log.warning(
+                        "TileMerge: tile %d changed size frame %d: expected %s got %s — "
+                        "rebuilding mask pyramid for this frame",
+                        i, b, cached_tile_sizes[i], (th, tw),
+                    )
+                    mask = self.create_gaussian_mask(
+                        th, tw,
+                        layout['ov_t'], layout['ov_b'],
+                        layout['ov_l'], layout['ov_r'],
+                        device,
+                    )
+                    tile_mask_pyr = self._build_gaussian_pyramid(mask, levels)
+                else:
+                    tile_mask_pyr = mask_pyramids[i]
 
-                x, y = layout['x'], layout['y']
-                h_slice = min(curr_h, tc['orig_h'] - y)
-                w_slice = min(curr_w, tc['orig_w'] - x)
+                # Build Laplacian pyramid for this tile frame
+                tile_pyr = self._build_laplacian_pyramid(tile_frame, levels)
 
-                accum [:, :, y:y+h_slice, x:x+w_slice] += tile_frame[:, :, :h_slice, :w_slice] * mask[:, :, :h_slice, :w_slice]
-                weight[:, :, y:y+h_slice, x:x+w_slice] += mask[:, :, :h_slice, :w_slice]
+                # Accumulate each pyramid level into the canvas accumulators
+                for l in range(levels):
+                    # Pixel position in the downsampled canvas at this level.
+                    # Uses right-shift (floor-div by 2^l) — matches F.interpolate.
+                    x_l = layout['x'] >> l
+                    y_l = layout['y'] >> l
 
-            output_frames.append((accum / (weight + 1e-8)).permute(0, 2, 3, 1).cpu())
+                    canvas_h, canvas_w = canvas_sizes[l]
+                    lvl_h = tile_pyr[l].shape[2]
+                    lvl_w = tile_pyr[l].shape[3]
+
+                    # Clamp to canvas boundary (handles edge tiles)
+                    h_sl = min(lvl_h, canvas_h - y_l)
+                    w_sl = min(lvl_w, canvas_w - x_l)
+
+                    if h_sl <= 0 or w_sl <= 0:
+                        log.debug("TileMerge: tile %d level %d out of canvas bounds, skipping", i, l)
+                        continue
+
+                    m = tile_mask_pyr[l][:, :, :h_sl, :w_sl]
+                    accum [l][:, :, y_l:y_l+h_sl, x_l:x_l+w_sl] += tile_pyr[l][:, :, :h_sl, :w_sl] * m
+                    weight[l][:, :, y_l:y_l+h_sl, x_l:x_l+w_sl] += m
+
+            # Normalise each pyramid level then collapse back to full resolution
+            blended_pyr = [accum[l] / (weight[l] + 1e-8) for l in range(levels)]
+            frame_out   = self._collapse_pyramid(blended_pyr)
+            output_frames.append(frame_out.permute(0, 2, 3, 1).cpu())
 
         result = torch.cat(output_frames, dim=0).clamp(0, 1)
         log.info("TileMerge: done — output shape=%s", result.shape)
         return (result,)
 
+
+# ======================================================================
+# ComfyUI registration
+# ======================================================================
 
 NODE_CLASS_MAPPINGS = {
     "TileSplit": TileSplit,
