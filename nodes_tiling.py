@@ -77,7 +77,7 @@ class TilingNodeBase:
           indices 0 … levels-2 : Laplacian detail planes, finest → coarsest
           index   levels-1     : coarsest Gaussian residual
 
-        This is a pure-PyTorch, GPU-resident operation.
+        Pure-PyTorch, GPU-resident operation.
         """
         pyramid = []
         current = img
@@ -97,7 +97,7 @@ class TilingNodeBase:
         """
         Build a Gaussian pyramid for a (1, 1, H, W) blending mask.
 
-        Returns `levels` tensors from finest to coarsest.  Downsampling the
+        Returns `levels` tensors from finest to coarsest. Downsampling the
         mask means low-frequency pyramid bands blend over a proportionally
         wider spatial transition than high-frequency bands — the core benefit
         of multi-band blending.
@@ -187,8 +187,8 @@ class TileSplit(TilingNodeBase):
             }
         }
 
-    RETURN_TYPES  = ("IMAGE", "IMAGE", "TILE_CALC")
-    RETURN_NAMES  = ("tiles", "debug_image", "tile_calc")
+    RETURN_TYPES   = ("IMAGE", "IMAGE", "TILE_CALC")
+    RETURN_NAMES   = ("tiles", "debug_image", "tile_calc")
     OUTPUT_IS_LIST = (True, False, False)
     FUNCTION  = "split"
     CATEGORY  = "FEnodes"
@@ -197,20 +197,30 @@ class TileSplit(TilingNodeBase):
         B, H, W, C = image.shape
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Base tile size = canvas divided evenly.
-        # overlap_percent extends each tile so adjacent tiles share pixels —
-        # those shared pixels are feathered during merge.
-        base_tile_w = W / tiles_x
-        base_tile_h = H / tiles_y
-        overlap_px_x = (int(base_tile_w * overlap_percent) // 8) * 8
-        overlap_px_y = (int(base_tile_h * overlap_percent) // 8) * 8
+        # overlap_percent means exactly "this fraction of the tile width/height
+        # is shared with each neighbour."
+        #
+        # Derivation:
+        #   Each interior tile contributes (tile_w × (1 - overlap)) unique pixels.
+        #   The last tile contributes tile_w unique pixels.
+        #   Total unique pixels = tile_w × ((1 - overlap) × (n-1) + 1) = W
+        #   → tile_w = W / ((1 - overlap) × (n-1) + 1)
+        #
+        # At overlap=0.50, tiles_x=2: tile_w = W / 1.5  (exactly half overlaps)
+        # At overlap=0.00, tiles_x=2: tile_w = W / 2    (no overlap)
 
-        tile_w = min(((int(base_tile_w) + overlap_px_x + 7) // 8) * 8, W)
-        tile_h = min(((int(base_tile_h) + overlap_px_y + 7) // 8) * 8, H)
+        tile_w_f = W / ((1.0 - overlap_percent) * (tiles_x - 1) + 1)
+        tile_h_f = H / ((1.0 - overlap_percent) * (tiles_y - 1) + 1)
 
+        # Round up to nearest multiple of 8 (model compatibility), clamp to canvas
+        tile_w = min(((int(tile_w_f) + 7) // 8) * 8, W)
+        tile_h = min(((int(tile_h_f) + 7) // 8) * 8, H)
+
+        # Space tile origins evenly so they cover the full canvas
         start_x = np.linspace(0, W - tile_w, tiles_x, dtype=int) if tiles_x > 1 else [0]
         start_y = np.linspace(0, H - tile_h, tiles_y, dtype=int) if tiles_y > 1 else [0]
 
+        # Actual overlap in pixels after rounding (for the log)
         actual_ov_x = tile_w - int((W - tile_w) / max(tiles_x - 1, 1)) if tiles_x > 1 else 0
         actual_ov_y = tile_h - int((H - tile_h) / max(tiles_y - 1, 1)) if tiles_y > 1 else 0
 
@@ -222,10 +232,10 @@ class TileSplit(TilingNodeBase):
             (actual_ov_x / tile_w) * 100, (actual_ov_y / tile_h) * 100,
         )
 
-        img_tensor    = image.permute(0, 3, 1, 2).to(device)
-        num_tiles     = tiles_x * tiles_y
+        img_tensor     = image.permute(0, 3, 1, 2).to(device)
+        num_tiles      = tiles_x * tiles_y
         tile_sequences = [[] for _ in range(num_tiles)]
-        tile_layouts  = []
+        tile_layouts   = []
 
         # Debug overlay
         debug_pil = Image.fromarray(
@@ -248,10 +258,10 @@ class TileSplit(TilingNodeBase):
                         tile_frame.permute(0, 2, 3, 1).cpu())
 
                     if b == 0:
-                        ov_l = int(tile_w - (start_x[x_idx] - start_x[x_idx-1])) if x_idx > 0             else 0
-                        ov_r = int(tile_w - (start_x[x_idx+1] - start_x[x_idx])) if x_idx < tiles_x - 1  else 0
-                        ov_t = int(tile_h - (start_y[y_idx] - start_y[y_idx-1])) if y_idx > 0             else 0
-                        ov_b = int(tile_h - (start_y[y_idx+1] - start_y[y_idx])) if y_idx < tiles_y - 1  else 0
+                        ov_l = int(tile_w - (start_x[x_idx] - start_x[x_idx-1])) if x_idx > 0            else 0
+                        ov_r = int(tile_w - (start_x[x_idx+1] - start_x[x_idx])) if x_idx < tiles_x - 1 else 0
+                        ov_t = int(tile_h - (start_y[y_idx] - start_y[y_idx-1])) if y_idx > 0            else 0
+                        ov_b = int(tile_h - (start_y[y_idx+1] - start_y[y_idx])) if y_idx < tiles_y - 1 else 0
 
                         tile_layouts.append({
                             "x": int(x), "y": int(y),
@@ -322,11 +332,11 @@ class TileMerge(TilingNodeBase):
     CATEGORY       = "FEnodes"
 
     def merge(self, tiles, tile_calc):
-        tc      = tile_calc[0]
-        device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        levels  = self.PYRAMID_LEVELS
-        orig_h  = tc['orig_h']
-        orig_w  = tc['orig_w']
+        tc     = tile_calc[0]
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        levels = self.PYRAMID_LEVELS
+        orig_h = tc['orig_h']
+        orig_w = tc['orig_w']
 
         # Unwrap any extra list nesting ComfyUI may add
         tile_list = tiles
@@ -344,7 +354,7 @@ class TileMerge(TilingNodeBase):
         for idx, t in enumerate(tile_list):
             log.debug("TileMerge: tile[%d] shape=%s dtype=%s", idx, t.shape, t.dtype)
 
-        # Canvas size at each pyramid level (used to allocate accumulators)
+        # Canvas size at each pyramid level
         canvas_sizes = self._canvas_pyramid_sizes(orig_h, orig_w, levels)
         log.debug("TileMerge: canvas pyramid sizes %s", canvas_sizes)
 
@@ -354,8 +364,8 @@ class TileMerge(TilingNodeBase):
         # Computed once from the first frame; reused for every subsequent frame.
         # ------------------------------------------------------------------
         log.info("TileMerge: pre-computing mask pyramids for %d tiles", len(tc['layouts']))
-        mask_pyramids   = []      # mask_pyramids[tile_idx][level] → (1,1,H,W)
-        cached_tile_sizes = []    # record (H, W) so we can detect size changes
+        mask_pyramids     = []
+        cached_tile_sizes = []
 
         for i, layout in enumerate(tc['layouts']):
             raw_first = tile_list[i][0]
@@ -392,11 +402,11 @@ class TileMerge(TilingNodeBase):
                 th, tw     = tile_frame.shape[2], tile_frame.shape[3]
                 log.debug("TileMerge: frame %d tile %d normalised shape=%s", b, i, tile_frame.shape)
 
-                # Warn if tile size changed between frames (e.g. model resized it)
+                # Warn and rebuild mask if tile size changed between frames
                 if (th, tw) != cached_tile_sizes[i]:
                     log.warning(
-                        "TileMerge: tile %d changed size frame %d: expected %s got %s — "
-                        "rebuilding mask pyramid for this frame",
+                        "TileMerge: tile %d changed size at frame %d "
+                        "(expected %s, got %s) — rebuilding mask pyramid",
                         i, b, cached_tile_sizes[i], (th, tw),
                     )
                     mask = self.create_gaussian_mask(
@@ -409,13 +419,13 @@ class TileMerge(TilingNodeBase):
                 else:
                     tile_mask_pyr = mask_pyramids[i]
 
-                # Build Laplacian pyramid for this tile frame
+                # Laplacian pyramid for this tile frame
                 tile_pyr = self._build_laplacian_pyramid(tile_frame, levels)
 
-                # Accumulate each pyramid level into the canvas accumulators
+                # Accumulate each level into the canvas accumulators
                 for l in range(levels):
-                    # Pixel position in the downsampled canvas at this level.
-                    # Uses right-shift (floor-div by 2^l) — matches F.interpolate.
+                    # Scale tile origin to this pyramid level.
+                    # Right-shift == floor(x / 2^l), matching F.interpolate behaviour.
                     x_l = layout['x'] >> l
                     y_l = layout['y'] >> l
 
@@ -428,14 +438,14 @@ class TileMerge(TilingNodeBase):
                     w_sl = min(lvl_w, canvas_w - x_l)
 
                     if h_sl <= 0 or w_sl <= 0:
-                        log.debug("TileMerge: tile %d level %d out of canvas bounds, skipping", i, l)
+                        log.debug("TileMerge: tile %d level %d out of canvas — skipping", i, l)
                         continue
 
                     m = tile_mask_pyr[l][:, :, :h_sl, :w_sl]
                     accum [l][:, :, y_l:y_l+h_sl, x_l:x_l+w_sl] += tile_pyr[l][:, :, :h_sl, :w_sl] * m
                     weight[l][:, :, y_l:y_l+h_sl, x_l:x_l+w_sl] += m
 
-            # Normalise each pyramid level then collapse back to full resolution
+            # Normalise then collapse pyramid back to full resolution
             blended_pyr = [accum[l] / (weight[l] + 1e-8) for l in range(levels)]
             frame_out   = self._collapse_pyramid(blended_pyr)
             output_frames.append(frame_out.permute(0, 2, 3, 1).cpu())
