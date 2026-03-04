@@ -1,4 +1,5 @@
 # ComfyUI VFX Nodes
+
 ### by [FugitiveExpert01](https://github.com/FugitiveExpert01)
 
 > A growing collection of custom ComfyUI nodes built for VFX production pipelines — designed around the real demands of working with high-resolution imagery, video sequences, and AI-assisted visual effects workflows.
@@ -16,6 +17,7 @@ Nodes are built with **video batch support as a first-class concern** — not an
 ## 🧩 Nodes
 
 ### 🔲 TileSplit
+
 > Splits an image or video batch into an overlapping grid of tiles, ready to be passed individually to a model.
 
 | Parameter | Type | Description |
@@ -36,6 +38,7 @@ Nodes are built with **video batch support as a first-class concern** — not an
 ---
 
 ### 🔳 TileMerge
+
 > Reconstructs a full image or video sequence from processed tiles using Laplacian Pyramid blending for seamless, artifact-free joins.
 
 | Parameter | Type | Description |
@@ -53,9 +56,62 @@ Nodes are built with **video batch support as a first-class concern** — not an
 
 ---
 
+### 🎬 Video Upscale With Model
+
+> Memory-efficient upscaling of every frame in a video batch using a ComfyUI upscale model (ESRGAN, RealESRGAN, etc.).
+
+| Parameter | Type | Description |
+|---|---|---|
+| `model_name` | upscale_models | Model from your ComfyUI `upscale_models` folder |
+| `images` | IMAGE | Input video batch `(F, H, W, C)` |
+| `upscale_method` | ENUM | Final resize filter: `nearest-exact`, `bilinear`, `area`, `bicubic` |
+| `factor` | FLOAT | Output scale multiplier (e.g. `2.0` = double resolution) |
+| `device_strategy` | ENUM | See table below |
+| `batch_size` | INT | Frames processed per GPU pass |
+
+**Device strategies:**
+
+| Strategy | Description |
+|---|---|
+| `auto` | Detects free VRAM and picks the best strategy automatically |
+| `keep_loaded` | Model stays on GPU — fastest, requires available VRAM |
+| `load_unload_each_frame` | Model moves to GPU per batch then back to CPU — lower peak VRAM |
+| `cpu_only` | Runs entirely on CPU — slowest, minimal VRAM usage |
+
+**Outputs:** `upscaled_images (IMAGE)`
+
+**Features:**
+- Automatic tiled inference via `comfy.utils.tiled_scale` — no OOM on large frames
+- Single `movedim` pre-pass avoids repeated tensor copies per frame
+- `torch.no_grad()` throughout for faster inference and lower memory
+- Coloured progress bar with elapsed/ETA printed to the ComfyUI console
+
+---
+
+### 🧹 Free Video Memory
+
+> Pass-through node that explicitly flushes GPU memory between heavy pipeline stages.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `images` | IMAGE | Passed through unchanged |
+| `aggressive_cleanup` | ENUM | Also calls `torch.cuda.synchronize()` and allocator cache APIs if available |
+| `report_memory` | ENUM | Prints allocated/reserved GB before and after to the console |
+
+**Outputs:** `images (IMAGE)` — identical to input
+
+---
+
+### 🔤 Text List → Batch / Text Batch → List
+
+Bidirectional converters between ComfyUI `LIST` and batched `STRING` types, with optional delimiter joining.
+
+---
+
 ## ⚙️ Installation
 
 **1. Clone into your ComfyUI custom nodes folder:**
+
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/FugitiveExpert01/ComfyUI-FEnodes.git
@@ -63,32 +119,43 @@ git clone https://github.com/FugitiveExpert01/ComfyUI-FEnodes.git
 
 **2. Restart ComfyUI.**
 
-Nodes will appear in the node menu. No additional dependencies beyond what ComfyUI already requires (PyTorch, NumPy, Pillow).
+Nodes will appear in the node menu under the **FEnodes** category.  
+No additional dependencies beyond what ComfyUI already requires (PyTorch, NumPy, Pillow).
 
 ---
 
-## 🎬 Typical Workflow
+## 🎬 Typical Workflows
 
+**Tiled video diffusion:**
 ```
-Load Image/Video → TileSplit → [Video Model / K-Sampler per tile] → TileMerge → Save Image/Video
+Load Video → TileSplit → [K-Sampler per tile] → TileMerge → Save Video
 ```
 
-`TileSplit` outputs a list of tile sequences so each tile can be routed through a video model independently, then `TileMerge` reconstructs the full frame. This allows processing of resolutions that would otherwise exceed VRAM limits.
+**Video upscaling:**
+```
+Load Video → Video Upscale With Model → [Free Video Memory] → Save Video
+```
+
+**Combined:**
+```
+Load Video → TileSplit → [K-Sampler per tile] → TileMerge
+          → Video Upscale With Model → Free Video Memory → Save Video
+```
 
 ---
 
 ## 🗺️ Roadmap
 
-> This repo is actively developed alongside VFX production work.
-
 | Node | Description | Status |
-| --- | --- | --- |
+|---|---|---|
 | **TileSplit** | Grid tile splitting for video batches | ✅ Released |
 | **TileMerge** | Laplacian pyramid tile reconstruction | ✅ Released |
-| **Text List → Batch** | Convert text lists to batched string inputs | ✅ Released |
-| **Text Batch → List** | Convert batched strings back to lists | ✅ Released |
+| **Video Upscale With Model** | Memory-efficient per-frame upscaling | ✅ Released |
+| **Free Video Memory** | Explicit VRAM flush between pipeline stages | ✅ Released |
+| **Text List → Batch** | LIST to batched STRING conversion | ✅ Released |
+| **Text Batch → List** | Batched STRING to LIST conversion | ✅ Released |
 
-Have a node idea or a production use case that isn't covered? **[Open an issue](https://github.com/FugitiveExpert01/comfyui-vfx-nodes/issues).**
+Have a node idea or a production use case that isn't covered? **[Open an issue](https://github.com/FugitiveExpert01/ComfyUI-FEnodes/issues).**
 
 ---
 
@@ -99,6 +166,7 @@ Pull requests are welcome. If you're adding a node, please:
 - Keep video batch support (`F, H, W, C`) as the primary tensor convention
 - Add a docstring describing what the node does and its input/output types
 - Test with both single images and multi-frame video batches
+- Set `CATEGORY = "FEnodes"` so nodes appear grouped in the menu
 
 ---
 
