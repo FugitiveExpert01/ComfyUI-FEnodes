@@ -58,7 +58,7 @@ Nodes are built with **video batch support as a first-class concern** — not an
 **1. Clone into your ComfyUI custom nodes folder:**
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/FugitiveExpert01/Comfy-UI-FEnodes.git
+git clone https://github.com/FugitiveExpert01/ComfyUI-FEnodes.git
 ```
 
 **2. Restart ComfyUI.**
