@@ -1,0 +1,23 @@
+[project]
+name = "fenodes"
+version = "1.0.0"
+description = "Tiling and text utility nodes for VFX production pipelines in ComfyUI"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+dependencies = [
+    "torch",
+    "numpy",
+    "Pillow",
+]
+classifiers = [
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/FugitiveExpert01/ComfyUI-FEnodes"
+"Bug Tracker" = "https://github.com/FugitiveExpert01/ComfyUI-FEnodes/issues"
+
+[tool.comfy]
+PublisherId = "FugitiveExpert01"
+DisplayName = "FEnodes"
+requires-comfyui = ">=1.0.0"
