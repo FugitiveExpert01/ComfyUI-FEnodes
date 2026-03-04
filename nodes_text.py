@@ -3,6 +3,10 @@ FEnodes — Text utility nodes for VFX production pipelines.
 Author: FugitiveExpert01
 """
 
+import logging
+
+log = logging.getLogger(__name__)
+
 
 class TextListToBatch:
     """
@@ -31,12 +35,15 @@ class TextListToBatch:
 
     def convert(self, text_list, delimiter=""):
         if not isinstance(text_list, (list, tuple)):
+            log.debug("TextListToBatch: non-list input received (%s), wrapping in list", type(text_list).__name__)
             text_list = [str(text_list)]
 
         if delimiter:
             result = [delimiter.join(str(t) for t in text_list)]
+            log.info("TextListToBatch: joined %d strings with delimiter into 1 output", len(text_list))
         else:
             result = [str(t) for t in text_list]
+            log.info("TextListToBatch: converted list of %d strings to batch", len(result))
 
         return (result,)
 
@@ -63,8 +70,12 @@ class TextBatchToList:
 
     def convert(self, text_batch):
         if not isinstance(text_batch, (list, tuple)):
+            log.debug("TextBatchToList: non-list input received (%s), wrapping in list", type(text_batch).__name__)
             text_batch = [text_batch]
-        return ([str(t) for t in text_batch],)
+
+        result = [str(t) for t in text_batch]
+        log.info("TextBatchToList: converted batch of %d strings to list", len(result))
+        return (result,)
 
 
 NODE_CLASS_MAPPINGS = {
