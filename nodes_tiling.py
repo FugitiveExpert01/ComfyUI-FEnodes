@@ -1,10 +1,10 @@
 """
 FEnodes — Tiling nodes for VFX production pipelines.
 Author: FugitiveExpert01
-Version: v0.0.2
+Version: v0.0.3
 """
 
-__version__ = "v0.0.2"
+__version__ = "v0.0.3"
 
 import torch
 import torch.nn.functional as F
@@ -13,7 +13,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 class TilingNodeBase:
-    """Base utility for Laplacian Frequency Blending and Grid Math."""
+    """Base utility for tile masking and tensor shape normalisation."""
 
     @staticmethod
     def ensure_4d_BCHW(t, device):
@@ -21,8 +21,7 @@ class TilingNodeBase:
         if t.dim() == 2:
             t = t.unsqueeze(0).unsqueeze(0)
         elif t.dim() == 3:
-            t = t.unsqueeze(0)
-            t = t.permute(0, 3, 1, 2)
+            t = t.unsqueeze(0).permute(0, 3, 1, 2)
         elif t.dim() == 4:
             if t.shape[-1] in (1, 3, 4):
                 t = t.permute(0, 3, 1, 2)
@@ -32,65 +31,61 @@ class TilingNodeBase:
         return t.contiguous()
 
     @staticmethod
-    def get_pyramid(img, levels=4):
-        assert img.dim() == 4, f"get_pyramid expects 4D tensor, got {img.shape}"
-        pyramid = []
-        current = img
-        for i in range(levels - 1):
-            orig_h, orig_w = current.shape[2], current.shape[3]
-            nxt = F.interpolate(current, scale_factor=0.5, mode='bilinear', align_corners=False)
-            up  = F.interpolate(nxt, size=(orig_h, orig_w), mode='bilinear', align_corners=False)
-            pyramid.append(current - up)
-            current = nxt
-        pyramid.append(current)
-        return pyramid
+    def create_feather_mask(h, w, ov_top, ov_bottom, ov_left, ov_right, feather_scale, device):
+        """
+        Linear feather mask.  feather_scale multiplies each overlap zone so the
+        user can widen or tighten the fade without touching TileSplit's overlap_percent.
+        Values are clamped so the fade never exceeds half the tile dimension.
+        """
+        ov_top    = min(int(ov_top    * feather_scale), h // 2)
+        ov_bottom = min(int(ov_bottom * feather_scale), h // 2)
+        ov_left   = min(int(ov_left   * feather_scale), w // 2)
+        ov_right  = min(int(ov_right  * feather_scale), w // 2)
 
-    @staticmethod
-    def create_gaussian_mask(h, w, overlap_top, overlap_bottom, overlap_left, overlap_right, device):
         mask = torch.ones((1, 1, h, w), device=device)
-        if overlap_top > 0:
-            mask[:, :, :overlap_top, :] *= torch.linspace(0, 1, overlap_top, device=device).view(1, 1, overlap_top, 1)
-        if overlap_bottom > 0:
-            mask[:, :, -overlap_bottom:, :] *= torch.linspace(1, 0, overlap_bottom, device=device).view(1, 1, overlap_bottom, 1)
-        if overlap_left > 0:
-            mask[:, :, :, :overlap_left] *= torch.linspace(0, 1, overlap_left, device=device).view(1, 1, 1, overlap_left)
-        if overlap_right > 0:
-            mask[:, :, :, -overlap_right:] *= torch.linspace(1, 0, overlap_right, device=device).view(1, 1, 1, overlap_right)
+        if ov_top > 0:
+            mask[:, :, :ov_top, :]     *= torch.linspace(0, 1, ov_top,    device=device).view(1, 1, ov_top,    1)
+        if ov_bottom > 0:
+            mask[:, :, -ov_bottom:, :] *= torch.linspace(1, 0, ov_bottom, device=device).view(1, 1, ov_bottom, 1)
+        if ov_left > 0:
+            mask[:, :, :, :ov_left]    *= torch.linspace(0, 1, ov_left,   device=device).view(1, 1, 1, ov_left)
+        if ov_right > 0:
+            mask[:, :, :, -ov_right:]  *= torch.linspace(1, 0, ov_right,  device=device).view(1, 1, 1, ov_right)
         return mask
 
 
-# Alignment options exposed to the user as a dropdown
 ALIGNMENT_OPTIONS = ["Free", "8 (SD)", "16 (WAN / VACE)"]
 
 
 class TileSplit(TilingNodeBase):
-    """Splits Video Batches into a List of Video Batches for FEnodes."""
+    """Splits an image or video batch into a list of tile batches."""
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "image": ("IMAGE",),
-                "tiles_x": ("INT", {"default": 2, "min": 1, "max": 10}),
-                "tiles_y": ("INT", {"default": 2, "min": 1, "max": 10}),
+                "image":           ("IMAGE",),
+                "tiles_x":         ("INT",   {"default": 2,    "min": 1,   "max": 10}),
+                "tiles_y":         ("INT",   {"default": 2,    "min": 1,   "max": 10}),
                 "overlap_percent": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 0.5, "step": 0.01}),
                 "alignment": (ALIGNMENT_OPTIONS, {
                     "default": "Free",
                     "tooltip": (
-                        "Free: no snapping, tile size is exactly stride x (1 + overlap). "
-                        "8 (SD): snap to nearest multiple of 8 for SD 1.5 / SDXL. "
-                        "16 (WAN / VACE): snap to nearest multiple of 16 for WAN 2.1 / VACE "
-                        "(required to avoid token count mismatches in VACE blocks)."
+                        "Free: no snapping. "
+                        "8 (SD): snap tile dimensions to multiples of 8 for SD 1.5 / SDXL. "
+                        "16 (WAN / VACE): snap to multiples of 16 — required to avoid token "
+                        "count mismatches inside VACE attention blocks."
                     ),
                 }),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "TILE_CALC")
-    RETURN_NAMES = ("tiles", "debug_image", "tile_calc")
+    RETURN_TYPES   = ("IMAGE", "IMAGE", "TILE_CALC")
+    RETURN_NAMES   = ("tiles", "debug_image", "tile_calc")
     OUTPUT_IS_LIST = (True, False, False)
-    FUNCTION = "split"
-    CATEGORY = "FEnodes"
+    OUTPUT_NODE    = True
+    FUNCTION       = "split"
+    CATEGORY       = "FEnodes"
 
     def split(self, image, tiles_x, tiles_y, overlap_percent, alignment="Free"):
         B, H, W, C = image.shape
@@ -101,8 +96,8 @@ class TileSplit(TilingNodeBase):
 
         stride_w = W / tiles_x
         stride_h = H / tiles_y
-        raw_w = stride_w * (1.0 + overlap_percent)
-        raw_h = stride_h * (1.0 + overlap_percent)
+        raw_w    = stride_w * (1.0 + overlap_percent)
+        raw_h    = stride_h * (1.0 + overlap_percent)
 
         if align is not None:
             tile_w = int(np.ceil(raw_w / align) * align)
@@ -122,15 +117,15 @@ class TileSplit(TilingNodeBase):
             f"alignment={alignment}  tile={tile_h}x{tile_w}  overlap={overlap_percent:.0%}"
         )
 
-        img_tensor = image.permute(0, 3, 1, 2).to(device)
-        num_tiles = tiles_x * tiles_y
+        img_tensor     = image.permute(0, 3, 1, 2).to(device)
+        num_tiles      = tiles_x * tiles_y
         tile_sequences = [[] for _ in range(num_tiles)]
-        tile_layouts = []
+        tile_layouts   = []
 
         debug_pil = Image.fromarray((image[0].cpu().numpy() * 255).astype(np.uint8)).convert("RGBA")
-        overlay = Image.new("RGBA", debug_pil.size, (0, 0, 0, 120))
+        overlay   = Image.new("RGBA", debug_pil.size, (0, 0, 0, 120))
         debug_pil = Image.alpha_composite(debug_pil, overlay)
-        draw = ImageDraw.Draw(debug_pil)
+        draw      = ImageDraw.Draw(debug_pil)
         try:
             font = ImageFont.truetype("LiberationSans-Bold.ttf", int(tile_h * 0.15))
         except Exception:
@@ -150,9 +145,9 @@ class TileSplit(TilingNodeBase):
                         ov_b = (tile_h - (start_y[y_idx+1] - start_y[y_idx])) if y_idx < tiles_y - 1 else 0
 
                         tile_layouts.append({
-                            "x": int(x), "y": int(y),
+                            "x":    int(x), "y":    int(y),
                             "ov_l": int(tile_w - ov_l) if x_idx > 0 else 0, "ov_r": int(ov_r),
-                            "ov_t": int(tile_h - ov_t) if y_idx > 0 else 0, "ov_b": int(ov_b)
+                            "ov_t": int(tile_h - ov_t) if y_idx > 0 else 0, "ov_b": int(ov_b),
                         })
                         color = ((x_idx * 40) % 255, (y_idx * 60) % 255, 255, 100)
                         draw.rectangle([x, y, x + tile_w, y + tile_h], outline="white", fill=color, width=2)
@@ -160,51 +155,71 @@ class TileSplit(TilingNodeBase):
                     tile_count += 1
 
         final_tile_batches = [torch.cat(seq, dim=0) for seq in tile_sequences]
-        debug_out = torch.from_numpy(np.array(debug_pil.convert("RGB")).astype(np.float32) / 255.0).unsqueeze(0)
+        debug_out = torch.from_numpy(
+            np.array(debug_pil.convert("RGB")).astype(np.float32) / 255.0
+        ).unsqueeze(0)
+
         tile_calc = {
             "orig_w": W, "orig_h": H,
             "tile_w": tile_w, "tile_h": tile_h,
             "batch_size": B,
             "num_tiles": num_tiles,
-            "layouts": tile_layouts
+            "layouts": tile_layouts,
         }
 
-        return (final_tile_batches, debug_out, tile_calc)
+        # ── Footer: per-tile shape + total estimated VRAM ─────────────────────
+        tile_mb  = (B * tile_h * tile_w * C * 4) / (1024 ** 2)
+        total_mb = tile_mb * num_tiles
+        info_text = (
+            f"{num_tiles} tiles  ·  {B}×{tile_h}×{tile_w}×{C} each  "
+            f"·  ~{total_mb:.0f} MB total"
+        )
+        print(f"[FEnodes/TileSplit] {info_text}")
+
+        return {"ui": {"text": [info_text]}, "result": (final_tile_batches, debug_out, tile_calc)}
 
 
 class TileMerge(TilingNodeBase):
-    """Merges Video Batches back into a single image/video sequence."""
+    """Merges tile batches back into a single image / video sequence."""
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "tiles": ("IMAGE",),
+                "tiles":     ("IMAGE",),
                 "tile_calc": ("TILE_CALC",),
+                "feather_scale": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05,
+                    "tooltip": (
+                        "Scales the feather (fade) zone relative to the overlap set in TileSplit. "
+                        "1.0 = fade across exactly the overlap region. "
+                        "0.5 = tighter, harder edge. 2.0 = wider, softer blend."
+                    ),
+                }),
             }
         }
 
     INPUT_IS_LIST = True
-    RETURN_TYPES = ("IMAGE",)
-    FUNCTION = "merge"
-    CATEGORY = "FEnodes"
+    RETURN_TYPES  = ("IMAGE",)
+    OUTPUT_NODE   = True
+    FUNCTION      = "merge"
+    CATEGORY      = "FEnodes"
 
-    def merge(self, tiles, tile_calc):
-        tc = tile_calc[0]
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        levels = 4
+    def merge(self, tiles, tile_calc, feather_scale):
+        tc            = tile_calc[0]
+        feather_scale = feather_scale[0] if isinstance(feather_scale, list) else feather_scale
+        device        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # Unwrap nested list if ComfyUI double-wraps the tile list
         tile_list = tiles
         while isinstance(tile_list, list) and len(tile_list) == 1 and isinstance(tile_list[0], list):
             tile_list = tile_list[0]
 
-        print(f"[FEnodes/TileMerge] number of tiles received: {len(tile_list)}")
+        print(f"[FEnodes/TileMerge] tiles={len(tile_list)}  canvas={tc['orig_h']}x{tc['orig_w']}  feather_scale={feather_scale}")
         for idx, t in enumerate(tile_list):
             print(f"[FEnodes/TileMerge]   tile[{idx}] shape={t.shape} dtype={t.dtype}")
 
-        num_frames = tile_list[0].shape[0]
-        print(f"[FEnodes/TileMerge] num_frames={num_frames}  canvas={tc['orig_h']}x{tc['orig_w']}")
-
+        num_frames    = tile_list[0].shape[0]
         output_frames = []
 
         for b in range(num_frames):
@@ -212,54 +227,46 @@ class TileMerge(TilingNodeBase):
             weight = torch.zeros((1, 1, tc['orig_h'], tc['orig_w']), device=device, dtype=torch.float32)
 
             for i, layout in enumerate(tc['layouts']):
-                raw_frame = tile_list[i][b]
-                print(f"[FEnodes/TileMerge]   frame b={b} tile={i} raw shape={raw_frame.shape}")
+                tile_frame = self.ensure_4d_BCHW(tile_list[i][b], device)
 
-                tile_frame = self.ensure_4d_BCHW(raw_frame, device)
-                print(f"[FEnodes/TileMerge]   frame b={b} tile={i} after ensure_4d shape={tile_frame.shape}")
-
-                # ── Size guard ────────────────────────────────────────────────
-                # Video models (e.g. WAN) may return frames at a slightly
-                # different spatial resolution due to internal temporal padding.
-                # Resize back to expected tile dimensions so the gaussian mask
-                # and canvas placement are always correct.
+                # Resize if the model returned a slightly different spatial size
                 expected_h, expected_w = tc['tile_h'], tc['tile_w']
                 if tile_frame.shape[2] != expected_h or tile_frame.shape[3] != expected_w:
                     print(
-                        f"[FEnodes/TileMerge]   resizing tile {i} from "
-                        f"{tile_frame.shape[2]}x{tile_frame.shape[3]} -> "
-                        f"{expected_h}x{expected_w}"
+                        f"[FEnodes/TileMerge]   resizing tile {i} "
+                        f"{tile_frame.shape[2]}x{tile_frame.shape[3]} → {expected_h}x{expected_w}"
                     )
                     tile_frame = F.interpolate(
                         tile_frame, size=(expected_h, expected_w),
                         mode='bilinear', align_corners=False
                     )
 
-                pyramid = self.get_pyramid(tile_frame, levels)
-                current_recon = pyramid[-1]
-                for lvl in reversed(range(levels - 1)):
-                    target_h, target_w = pyramid[lvl].shape[2], pyramid[lvl].shape[3]
-                    current_recon = F.interpolate(current_recon, size=(target_h, target_w), mode='bilinear', align_corners=False)
-                    current_recon += pyramid[lvl]
-
-                curr_h, curr_w = current_recon.shape[2], current_recon.shape[3]
-                mask = self.create_gaussian_mask(
+                curr_h, curr_w = tile_frame.shape[2], tile_frame.shape[3]
+                mask = self.create_feather_mask(
                     curr_h, curr_w,
                     layout['ov_t'], layout['ov_b'],
                     layout['ov_l'], layout['ov_r'],
-                    device
+                    feather_scale, device
                 )
 
-                x, y = layout['x'], layout['y']
+                x, y    = layout['x'], layout['y']
                 h_slice = min(curr_h, tc['orig_h'] - y)
                 w_slice = min(curr_w, tc['orig_w'] - x)
 
-                accum [:, :, y:y+h_slice, x:x+w_slice] += current_recon[:, :, :h_slice, :w_slice] * mask[:, :, :h_slice, :w_slice]
+                accum [:, :, y:y+h_slice, x:x+w_slice] += tile_frame[:, :, :h_slice, :w_slice] * mask[:, :, :h_slice, :w_slice]
                 weight[:, :, y:y+h_slice, x:x+w_slice] += mask[:, :, :h_slice, :w_slice]
 
             output_frames.append((accum / (weight + 1e-8)).permute(0, 2, 3, 1).cpu())
 
-        return (torch.cat(output_frames, dim=0).clamp(0, 1),)
+        output = torch.cat(output_frames, dim=0).clamp(0, 1)
+
+        # ── Footer: output shape + estimated size ─────────────────────────────
+        B, H, W, C = output.shape
+        out_mb     = (B * H * W * C * 4) / (1024 ** 2)
+        info_text  = f"Output: {B}×{H}×{W}×{C}  ·  ~{out_mb:.0f} MB"
+        print(f"[FEnodes/TileMerge] {info_text}")
+
+        return {"ui": {"text": [info_text]}, "result": (output,)}
 
 
 NODE_CLASS_MAPPINGS = {
@@ -271,3 +278,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TileSplit": "TileSplit",
     "TileMerge": "TileMerge",
 }
+
+
+
+
+
+
