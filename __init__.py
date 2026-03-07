@@ -3,10 +3,23 @@ FEnodes — ComfyUI custom node pack
 Author: FugitiveExpert01
 """
 
-from .nodes_tiling import NODE_CLASS_MAPPINGS as _TILING_CLASSES
-from .nodes_tiling import NODE_DISPLAY_NAME_MAPPINGS as _TILING_NAMES
-from .nodes_text import NODE_CLASS_MAPPINGS as _TEXT_CLASSES
-from .nodes_text import NODE_DISPLAY_NAME_MAPPINGS as _TEXT_NAMES
+import logging
+
+try:
+    from .nodes_tiling import NODE_CLASS_MAPPINGS as _TILING_CLASSES
+    from .nodes_tiling import NODE_DISPLAY_NAME_MAPPINGS as _TILING_NAMES
+except Exception as e:
+    logging.warning(f"[FEnodes] Failed to load Tiling nodes: {e}")
+    _TILING_CLASSES = {}
+    _TILING_NAMES = {}
+
+try:
+    from .nodes_text import NODE_CLASS_MAPPINGS as _TEXT_CLASSES
+    from .nodes_text import NODE_DISPLAY_NAME_MAPPINGS as _TEXT_NAMES
+except Exception as e:
+    logging.warning(f"[FEnodes] Failed to load Text nodes: {e}")
+    _TEXT_CLASSES = {}
+    _TEXT_NAMES = {}
 
 NODE_CLASS_MAPPINGS = {
     **_TILING_CLASSES,
