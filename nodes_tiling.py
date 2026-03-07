@@ -1,7 +1,10 @@
 """
 FEnodes — Tiling nodes for VFX production pipelines.
 Author: FugitiveExpert01
+Version: v0.0.2
 """
+
+__version__ = "v0.0.2"
 
 import torch
 import torch.nn.functional as F
@@ -14,34 +17,22 @@ class TilingNodeBase:
 
     @staticmethod
     def ensure_4d_BCHW(t, device):
-        """
-        Force any tensor into (1, C, H, W) float32 on the correct device.
-        Handles every shape a video model might produce for a single frame.
-        """
         t = t.to(device=device, dtype=torch.float32)
         if t.dim() == 2:
-            # (H, W) — greyscale, add batch + channel
-            t = t.unsqueeze(0).unsqueeze(0)          # (1, 1, H, W)
+            t = t.unsqueeze(0).unsqueeze(0)
         elif t.dim() == 3:
-            # Could be (H, W, C) channels-last or (C, H, W) channels-first
-            # ComfyUI convention is always channels-last, so treat as (H, W, C)
-            t = t.unsqueeze(0)                        # (1, H, W, C)
-            t = t.permute(0, 3, 1, 2)                # (1, C, H, W)
+            t = t.unsqueeze(0)
+            t = t.permute(0, 3, 1, 2)
         elif t.dim() == 4:
-            # Could be (1, H, W, C) or (1, C, H, W)
-            # If the last dim looks like a channel count it's channels-last
             if t.shape[-1] in (1, 3, 4):
-                t = t.permute(0, 3, 1, 2)            # (1, C, H, W)
-            # else already (1, C, H, W)
+                t = t.permute(0, 3, 1, 2)
         else:
             raise ValueError(f"[TileMerge] ensure_4d_BCHW: unexpected shape {t.shape}")
-
         assert t.dim() == 4, f"[TileMerge] ensure_4d_BCHW failed, result shape: {t.shape}"
         return t.contiguous()
 
     @staticmethod
     def get_pyramid(img, levels=4):
-        """img must be (1, C, H, W)."""
         assert img.dim() == 4, f"get_pyramid expects 4D tensor, got {img.shape}"
         pyramid = []
         current = img
@@ -86,7 +77,7 @@ class TileSplit(TilingNodeBase):
                 "alignment": (ALIGNMENT_OPTIONS, {
                     "default": "Free",
                     "tooltip": (
-                        "Free: no snapping, tile size is exactly stride × (1 + overlap). "
+                        "Free: no snapping, tile size is exactly stride x (1 + overlap). "
                         "8 (SD): snap to nearest multiple of 8 for SD 1.5 / SDXL. "
                         "16 (WAN / VACE): snap to nearest multiple of 16 for WAN 2.1 / VACE "
                         "(required to avoid token count mismatches in VACE blocks)."
@@ -105,14 +96,9 @@ class TileSplit(TilingNodeBase):
         B, H, W, C = image.shape
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Resolve alignment value from dropdown label
         align_map = {"Free": None, "8 (SD)": 8, "16 (WAN / VACE)": 16}
         align = align_map.get(alignment, None)
 
-        # ── Tile sizing ────────────────────────────────────────────────────────
-        # Base size = canvas / tiles (stride).
-        # Overlap expands each tile beyond the stride so neighbours share pixels.
-        # Alignment then snaps UP to the required multiple (or leaves as-is).
         stride_w = W / tiles_x
         stride_h = H / tiles_y
         raw_w = stride_w * (1.0 + overlap_percent)
@@ -125,18 +111,15 @@ class TileSplit(TilingNodeBase):
             tile_w = int(np.ceil(raw_w))
             tile_h = int(np.ceil(raw_h))
 
-        # Clamp: tile must never exceed canvas
         tile_w = min(tile_w, W)
         tile_h = min(tile_h, H)
 
-        # Spread tile start positions evenly across the canvas.
-        # linspace(0, W-tile_w) keeps the last tile flush with the right edge.
         start_x = np.linspace(0, W - tile_w, tiles_x, dtype=int) if tiles_x > 1 else np.array([0])
         start_y = np.linspace(0, H - tile_h, tiles_y, dtype=int) if tiles_y > 1 else np.array([0])
 
         print(
-            f"[FEnodes/TileSplit] canvas={H}×{W}  grid={tiles_y}×{tiles_x}  "
-            f"alignment={alignment}  tile={tile_h}×{tile_w}  overlap={overlap_percent:.0%}"
+            f"[FEnodes/TileSplit] canvas={H}x{W}  grid={tiles_y}x{tiles_x}  "
+            f"alignment={alignment}  tile={tile_h}x{tile_w}  overlap={overlap_percent:.0%}"
         )
 
         img_tensor = image.permute(0, 3, 1, 2).to(device)
@@ -229,7 +212,7 @@ class TileMerge(TilingNodeBase):
             weight = torch.zeros((1, 1, tc['orig_h'], tc['orig_w']), device=device, dtype=torch.float32)
 
             for i, layout in enumerate(tc['layouts']):
-                raw_frame  = tile_list[i][b]
+                raw_frame = tile_list[i][b]
                 print(f"[FEnodes/TileMerge]   frame b={b} tile={i} raw shape={raw_frame.shape}")
 
                 tile_frame = self.ensure_4d_BCHW(raw_frame, device)
@@ -244,8 +227,8 @@ class TileMerge(TilingNodeBase):
                 if tile_frame.shape[2] != expected_h or tile_frame.shape[3] != expected_w:
                     print(
                         f"[FEnodes/TileMerge]   resizing tile {i} from "
-                        f"{tile_frame.shape[2]}×{tile_frame.shape[3]} → "
-                        f"{expected_h}×{expected_w}"
+                        f"{tile_frame.shape[2]}x{tile_frame.shape[3]} -> "
+                        f"{expected_h}x{expected_w}"
                     )
                     tile_frame = F.interpolate(
                         tile_frame, size=(expected_h, expected_w),
@@ -287,3 +270,4 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "TileSplit": "TileSplit",
     "TileMerge": "TileMerge",
+}
