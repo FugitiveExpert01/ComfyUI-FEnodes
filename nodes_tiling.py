@@ -1,15 +1,20 @@
 """
 FEnodes — Tiling nodes for VFX production pipelines.
 Author: FugitiveExpert01
-Version: v0.0.3
+Version: v0.0.4
 """
 
-__version__ = "v0.0.3"
+__version__ = "v0.0.4"
 
 import torch
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+try:
+    from server import PromptServer
+except ImportError:
+    PromptServer = None
 
 
 class TilingNodeBase:
@@ -53,6 +58,15 @@ class TilingNodeBase:
             mask[:, :, :, -ov_right:]  *= torch.linspace(1, 0, ov_right,  device=device).view(1, 1, 1, ov_right)
         return mask
 
+    @staticmethod
+    def _send_text(unique_id, html):
+        """Push a progress text update to the node footer in the ComfyUI frontend."""
+        if unique_id is not None and PromptServer is not None:
+            try:
+                PromptServer.instance.send_progress_text(html, unique_id)
+            except Exception:
+                pass
+
 
 ALIGNMENT_OPTIONS = ["Free", "8 (SD)", "16 (WAN / VACE)"]
 
@@ -77,17 +91,19 @@ class TileSplit(TilingNodeBase):
                         "count mismatches inside VACE attention blocks."
                     ),
                 }),
-            }
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     RETURN_TYPES   = ("IMAGE", "IMAGE", "TILE_CALC")
     RETURN_NAMES   = ("tiles", "debug_image", "tile_calc")
     OUTPUT_IS_LIST = (True, False, False)
-    OUTPUT_NODE    = True
     FUNCTION       = "split"
     CATEGORY       = "FEnodes"
 
-    def split(self, image, tiles_x, tiles_y, overlap_percent, alignment="Free"):
+    def split(self, image, tiles_x, tiles_y, overlap_percent, alignment="Free", unique_id=None):
         B, H, W, C = image.shape
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -167,16 +183,16 @@ class TileSplit(TilingNodeBase):
             "layouts": tile_layouts,
         }
 
-        # ── Footer: per-tile shape + total estimated VRAM ─────────────────────
+        # ── Footer ────────────────────────────────────────────────────────────
         tile_mb  = (B * tile_h * tile_w * C * 4) / (1024 ** 2)
         total_mb = tile_mb * num_tiles
-        info_text = (
-            f"{num_tiles} tiles  ·  {B}×{tile_h}×{tile_w}×{C} each  "
-            f"·  ~{total_mb:.0f} MB total"
-        )
-        print(f"[FEnodes/TileSplit] {info_text}")
+        self._send_text(unique_id, (
+            f"<tr><td>Tiles: </td>"
+            f"<td><b>{num_tiles}</b> × <b>{B}</b>×<b>{tile_h}</b>×<b>{tile_w}</b> "
+            f"| <b>{total_mb:.0f} MB</b></td></tr>"
+        ))
 
-        return {"ui": {"text": [info_text]}, "result": (final_tile_batches, debug_out, tile_calc)}
+        return (final_tile_batches, debug_out, tile_calc)
 
 
 class TileMerge(TilingNodeBase):
@@ -196,18 +212,21 @@ class TileMerge(TilingNodeBase):
                         "0.5 = tighter, harder edge. 2.0 = wider, softer blend."
                     ),
                 }),
-            }
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     INPUT_IS_LIST = True
     RETURN_TYPES  = ("IMAGE",)
-    OUTPUT_NODE   = True
     FUNCTION      = "merge"
     CATEGORY      = "FEnodes"
 
-    def merge(self, tiles, tile_calc, feather_scale):
+    def merge(self, tiles, tile_calc, feather_scale, unique_id=None):
         tc            = tile_calc[0]
         feather_scale = feather_scale[0] if isinstance(feather_scale, list) else feather_scale
+        unique_id     = unique_id[0] if isinstance(unique_id, list) else unique_id
         device        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Unwrap nested list if ComfyUI double-wraps the tile list
@@ -260,13 +279,16 @@ class TileMerge(TilingNodeBase):
 
         output = torch.cat(output_frames, dim=0).clamp(0, 1)
 
-        # ── Footer: output shape + estimated size ─────────────────────────────
+        # ── Footer ────────────────────────────────────────────────────────────
         B, H, W, C = output.shape
-        out_mb     = (B * H * W * C * 4) / (1024 ** 2)
-        info_text  = f"Output: {B}×{H}×{W}×{C}  ·  ~{out_mb:.0f} MB"
-        print(f"[FEnodes/TileMerge] {info_text}")
+        out_mb = (output.numel() * output.element_size()) / (1024 ** 2)
+        self._send_text(unique_id, (
+            f"<tr><td>Output: </td>"
+            f"<td><b>{B}</b>×<b>{H}</b>×<b>{W}</b>×<b>{C}</b> "
+            f"| <b>{out_mb:.2f} MB</b></td></tr>"
+        ))
 
-        return {"ui": {"text": [info_text]}, "result": (output,)}
+        return (output,)
 
 
 NODE_CLASS_MAPPINGS = {
