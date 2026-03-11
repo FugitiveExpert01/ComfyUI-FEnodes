@@ -63,7 +63,7 @@ class FELoraLoad:
         return comfy.utils.calculate_file_hash(lora_path)
 
     def load(self, lora_name):
-        lora_path = folder_paths.get_full_path_by_key("loras", lora_name)
+        lora_path = folder_paths.get_full_path("loras", lora_name)
         logger.info(f"[FEnodes/FELoraLoad] Loading: {lora_name}")
         weights = comfy.utils.load_torch_file(lora_path, safe_load=True)
         return ({"name": lora_name, "path": lora_path, "weights": weights},)
