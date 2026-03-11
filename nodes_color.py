@@ -1,3 +1,6 @@
+
+Copy
+
 """
 FEnodes — Color anchoring nodes for VFX production pipelines.
 Author: FugitiveExpert01
@@ -11,22 +14,45 @@ ChromaPin:
            frame index in the processed video corresponds to it.
         2. We compute a color-correction transform from
                processed_ref_frame  →  original_reference_image
-           This transform captures the model's color drift as a calibration pair.
+           This transform captures the model's colour drift as a calibration pair.
         3. We apply that *same* transform to every frame in the video.
 
-    Why not just do per-frame color matching?
-        Each frame has different content and different color statistics.
+    Why not just do per-frame colour matching?
+        Each frame has different content and different colour statistics.
         Matching every frame's stats to the reference image would destroy
-        the natural color variation between frames.  Instead we use the
+        the natural colour variation between frames.  Instead we use the
         anchor pair to measure the drift *once* and then remove it everywhere.
+
+    Method groups
+    -------------
+    Anchor-fit + propagate (fast, no extra deps):
+        reinhard_lab    — Per-channel mean/std in Lab.  Good general purpose.
+        linear_rgb      — Per-channel gain/offset in sRGB.  Fastest.
+        histogram       — Per-channel CDF matching.  Best for non-linear shifts.
+        mkl             — Monge-Kantorovich Linearization.  Full 3x3 cross-channel
+                          transform in Lab.  Best of the no-dep methods.
+
+    GPU-accelerated (requires kornia):
+        reinhard_lab_gpu — Same math as reinhard_lab but runs on GPU via Kornia.
+
+    color-matcher library methods (requires: pip install color-matcher):
+        hm              — Histogram matching (color-matcher implementation).
+        mvgd            — Multi-Variate Gaussian Distribution transfer.
+        hm-mkl-hm       — HM → MKL → HM compound.  Best overall quality.
+        hm-mvgd-hm      — HM → MVGD → HM compound.
+
+        Note: color-matcher methods are fitted on the anchor pair and a
+        per-channel correction LUT is extracted and applied uniformly to all
+        frames — preserving ChromaPin's anchor-fit-then-propagate design.
 """
 
+import logging
 import torch
 import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# sRGB ↔ CIE L*a*b* helpers (pure numpy, no scipy dependency)
+# sRGB ↔ CIE L*a*b* helpers  (pure numpy, no extra deps)
 # ---------------------------------------------------------------------------
 
 def _srgb_to_linear(img: np.ndarray) -> np.ndarray:
@@ -42,7 +68,6 @@ def _linear_to_srgb(img: np.ndarray) -> np.ndarray:
                     1.055 * (img ** (1.0 / 2.4)) - 0.055).astype(np.float32)
 
 
-# sRGB D65 matrices
 _M_RGB2XYZ = np.array([[0.4124564, 0.3575761, 0.1804375],
                         [0.2126729, 0.7151522, 0.0721750],
                         [0.0193339, 0.1191920, 0.9503041]], dtype=np.float32)
@@ -55,7 +80,7 @@ _D65 = np.array([0.95047, 1.00000, 1.08883], dtype=np.float32)
 
 
 def _rgb_to_lab(img: np.ndarray) -> np.ndarray:
-    """(H, W, 3) float32 [0,1] sRGB → CIE L*a*b*."""
+    """(H, W, 3) float32 [0,1] sRGB -> CIE L*a*b*."""
     lin = _srgb_to_linear(img)
     xyz = lin.reshape(-1, 3) @ _M_RGB2XYZ.T
     xyz /= _D65
@@ -68,7 +93,7 @@ def _rgb_to_lab(img: np.ndarray) -> np.ndarray:
 
 
 def _lab_to_rgb(lab: np.ndarray) -> np.ndarray:
-    """CIE L*a*b* → (H, W, 3) float32 [0,1] sRGB."""
+    """CIE L*a*b* -> (H, W, 3) float32 [0,1] sRGB."""
     flat = lab.reshape(-1, 3)
     L, a, b = flat[:, 0], flat[:, 1], flat[:, 2]
     eps, kappa = 0.008856, 903.3
@@ -84,16 +109,11 @@ def _lab_to_rgb(lab: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Color-correction methods
-# Each method returns: (params_dict, apply_fn)
-# apply_fn(frame_np, params, strength) → corrected_np
+# Anchor-fit + propagate methods  (no extra deps)
 # ---------------------------------------------------------------------------
 
-def _fit_reinhard(src: np.ndarray, tgt: np.ndarray):
-    """
-    Reinhard et al. Lab-space colour transfer.
-    Params: per-channel mean & std of source and target in Lab.
-    """
+def _fit_reinhard(src: np.ndarray, tgt: np.ndarray) -> dict:
+    """Per-channel mean & std match in CIE Lab."""
     src_lab = _rgb_to_lab(src)
     tgt_lab = _rgb_to_lab(tgt)
     params = {}
@@ -116,11 +136,8 @@ def _apply_reinhard(frame: np.ndarray, params: dict, strength: float) -> np.ndar
     return _lab_to_rgb(blended)
 
 
-def _fit_linear_rgb(src: np.ndarray, tgt: np.ndarray):
-    """
-    Per-channel linear (gain + offset) in sRGB.
-    Matches first two moments (mean, std) of each channel.
-    """
+def _fit_linear_rgb(src: np.ndarray, tgt: np.ndarray) -> dict:
+    """Per-channel gain + offset in sRGB."""
     params = {}
     for c in range(3):
         sm = float(src[..., c].mean())
@@ -140,12 +157,8 @@ def _apply_linear_rgb(frame: np.ndarray, params: dict, strength: float) -> np.nd
     return out
 
 
-def _fit_histogram(src: np.ndarray, tgt: np.ndarray, bins: int = 512):
-    """
-    Per-channel histogram matching.
-    Builds a LUT that maps src's CDF onto tgt's CDF.
-    This is the most aggressive method and handles non-linear shifts.
-    """
+def _fit_histogram(src: np.ndarray, tgt: np.ndarray, bins: int = 512) -> dict:
+    """Per-channel CDF-based histogram matching."""
     params = {'bins': bins}
     for c in range(3):
         src_hist, _ = np.histogram(src[..., c].ravel(), bins=bins, range=(0.0, 1.0))
@@ -154,7 +167,6 @@ def _fit_histogram(src: np.ndarray, tgt: np.ndarray, bins: int = 512):
         src_cdf /= src_cdf[-1] + 1e-10
         tgt_cdf = np.cumsum(tgt_hist).astype(np.float64)
         tgt_cdf /= tgt_cdf[-1] + 1e-10
-        # For each src bin-value, find what tgt value has the same CDF
         tgt_vals = np.linspace(0.0, 1.0, bins)
         lut = np.interp(src_cdf, tgt_cdf, tgt_vals).astype(np.float32)
         params[f'lut_{c}'] = lut
@@ -163,7 +175,7 @@ def _fit_histogram(src: np.ndarray, tgt: np.ndarray, bins: int = 512):
 
 def _apply_histogram(frame: np.ndarray, params: dict, strength: float) -> np.ndarray:
     bins = params['bins']
-    out = frame.copy()
+    out  = frame.copy()
     for c in range(3):
         lut = params[f'lut_{c}']
         idx = np.clip((frame[..., c] * (bins - 1)).astype(np.int32), 0, bins - 1)
@@ -172,11 +184,167 @@ def _apply_histogram(frame: np.ndarray, params: dict, strength: float) -> np.nda
     return out
 
 
+def _fit_mkl(src: np.ndarray, tgt: np.ndarray) -> dict:
+    """
+    Monge-Kantorovich Linearization (MKL) in CIE Lab space.
+
+    Computes the exact 3x3 linear transform T such that applying T to
+    src pixels (centred by src mean) produces pixels whose covariance
+    matches tgt.  Unlike Reinhard, this handles cross-channel colour
+    interactions — e.g. a shift that simultaneously moves R up and G down.
+
+        T = Cs^{-1/2} . (Cs^{1/2} . Ct . Cs^{1/2})^{1/2} . Cs^{-1/2}
+
+    where Cs, Ct are the Lab covariance matrices of src and tgt.
+    """
+    src_lab = _rgb_to_lab(src).reshape(-1, 3).astype(np.float64)
+    tgt_lab = _rgb_to_lab(tgt).reshape(-1, 3).astype(np.float64)
+
+    mu_s = src_lab.mean(0)
+    mu_t = tgt_lab.mean(0)
+
+    Cs = np.cov((src_lab - mu_s).T, bias=False)
+    Ct = np.cov((tgt_lab - mu_t).T, bias=False)
+
+    vals_s, vecs_s = np.linalg.eigh(Cs)
+    vals_s         = np.maximum(vals_s, 1e-10)
+    Cs_sqrt        = vecs_s @ np.diag(np.sqrt(vals_s))       @ vecs_s.T
+    Cs_invsqrt     = vecs_s @ np.diag(1.0 / np.sqrt(vals_s)) @ vecs_s.T
+
+    M              = Cs_sqrt @ Ct @ Cs_sqrt
+    vals_m, vecs_m = np.linalg.eigh(M)
+    vals_m         = np.maximum(vals_m, 1e-10)
+    M_sqrt         = vecs_m @ np.diag(np.sqrt(vals_m)) @ vecs_m.T
+
+    T = (Cs_invsqrt @ M_sqrt @ Cs_invsqrt).astype(np.float32)
+
+    return {
+        'T':    T,
+        'mu_s': mu_s.astype(np.float32),
+        'mu_t': mu_t.astype(np.float32),
+    }
+
+
+def _apply_mkl(frame: np.ndarray, params: dict, strength: float) -> np.ndarray:
+    T, mu_s, mu_t = params['T'], params['mu_s'], params['mu_t']
+    lab            = _rgb_to_lab(frame)
+    flat           = lab.reshape(-1, 3).astype(np.float32)
+    corrected_flat = (flat - mu_s) @ T.T + mu_t
+    corrected_lab  = corrected_flat.reshape(lab.shape)
+    blended        = corrected_lab * strength + lab * (1.0 - strength)
+    return _lab_to_rgb(blended)
+
+
+# ---------------------------------------------------------------------------
+# GPU-accelerated method  (requires kornia)
+# ---------------------------------------------------------------------------
+
+def _fit_reinhard_gpu(src: np.ndarray, tgt: np.ndarray) -> dict:
+    """Same stats as reinhard_lab; GPU acceleration happens at apply time."""
+    return _fit_reinhard(src, tgt)
+
+
+def _apply_reinhard_gpu(frame: np.ndarray, params: dict, strength: float) -> np.ndarray:
+    try:
+        import kornia
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        t      = torch.from_numpy(frame).unsqueeze(0).permute(0, 3, 1, 2).to(device)
+        lab    = kornia.color.rgb_to_lab(t)          # (1, 3, H, W)
+        _, C, H, W = lab.shape
+        flat   = lab.view(1, C, -1)                  # (1, 3, HW)
+
+        s_mean = torch.tensor([params[f's_mean_{c}'] for c in range(3)], device=device).view(1, 3, 1)
+        s_std  = torch.tensor([params[f's_std_{c}']  for c in range(3)], device=device).view(1, 3, 1)
+        t_mean = torch.tensor([params[f't_mean_{c}'] for c in range(3)], device=device).view(1, 3, 1)
+        t_std  = torch.tensor([params[f't_std_{c}']  for c in range(3)], device=device).view(1, 3, 1)
+
+        corrected = (flat - s_mean) / s_std * t_std + t_mean
+        blended   = corrected * strength + flat * (1.0 - strength)
+        rgb_out   = kornia.color.lab_to_rgb(blended.view(1, C, H, W))
+
+        return rgb_out.clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy()
+
+    except ImportError:
+        logging.warning(
+            "[FEnodes/ChromaPin] kornia not installed — falling back to CPU reinhard_lab. "
+            "Install with: pip install kornia"
+        )
+        return _apply_reinhard(frame, params, strength)
+
+
+# ---------------------------------------------------------------------------
+# color-matcher library methods  (requires: pip install color-matcher)
+#
+# Strategy: run color-matcher once on the anchor pair, extract per-channel
+# 1-D correction LUTs from the resulting src->corrected pixel mapping, then
+# apply those LUTs uniformly to every frame — preserving ChromaPin's
+# anchor-fit-then-propagate design.
+# ---------------------------------------------------------------------------
+
+def _fit_color_matcher(src: np.ndarray, tgt: np.ndarray,
+                       cm_method: str, bins: int = 512) -> dict:
+    try:
+        from color_matcher import ColorMatcher
+    except ImportError as exc:
+        raise ImportError(
+            "[FEnodes/ChromaPin] color-matcher is not installed. "
+            "Install with: pip install color-matcher"
+        ) from exc
+
+    cm        = ColorMatcher()
+    corrected = np.clip(
+        cm.transfer(src=src, ref=tgt, method=cm_method).astype(np.float32),
+        0.0, 1.0,
+    )
+
+    # Build per-channel LUT: sort source pixels, interpolate at uniform grid.
+    params = {'bins': bins, 'cm_method': cm_method}
+    for c in range(3):
+        src_ch = src[..., c].ravel()
+        cor_ch = corrected[..., c].ravel()
+        order  = np.argsort(src_ch)
+        lut    = np.interp(
+            np.linspace(0.0, 1.0, bins),
+            src_ch[order],
+            cor_ch[order],
+        ).astype(np.float32)
+        params[f'lut_{c}'] = lut
+
+    return params
+
+
+def _apply_color_matcher(frame: np.ndarray, params: dict, strength: float) -> np.ndarray:
+    """Apply the extracted per-channel LUTs (identical to _apply_histogram)."""
+    return _apply_histogram(frame, params, strength)
+
+
+def _make_cm_pair(cm_method: str):
+    """Return (fit_fn, apply_fn) for a given color-matcher method string."""
+    def fit(src, tgt):
+        return _fit_color_matcher(src, tgt, cm_method)
+    return fit, _apply_color_matcher
+
+
+# ---------------------------------------------------------------------------
+# Method registry
+# ---------------------------------------------------------------------------
+
 _METHOD_MAP = {
-    "reinhard_lab": (_fit_reinhard,   _apply_reinhard),
-    "linear_rgb":   (_fit_linear_rgb, _apply_linear_rgb),
-    "histogram":    (_fit_histogram,  _apply_histogram),
+    # no extra deps
+    "reinhard_lab":     (_fit_reinhard,     _apply_reinhard),
+    "linear_rgb":       (_fit_linear_rgb,   _apply_linear_rgb),
+    "histogram":        (_fit_histogram,    _apply_histogram),
+    "mkl":              (_fit_mkl,          _apply_mkl),
+    # requires kornia
+    "reinhard_lab_gpu": (_fit_reinhard_gpu, _apply_reinhard_gpu),
+    # requires color-matcher
+    "hm":               _make_cm_pair("hm"),
+    "mvgd":             _make_cm_pair("mvgd"),
+    "hm-mkl-hm":        _make_cm_pair("hm-mkl-hm"),
+    "hm-mvgd-hm":       _make_cm_pair("hm-mvgd-hm"),
 }
+
 
 # ---------------------------------------------------------------------------
 # Node
@@ -208,17 +376,36 @@ class ChromaPin:
                Useful if you suspect the drift evolves over time, or if you
                only want to lock down a short region around the reference frame.
 
-    Methods
-    -------
-    reinhard_lab  — Matches per-channel mean & std in CIE L*a*b* space.
-                    Best general-purpose method; handles colour casts well.
-    linear_rgb    — Matches per-channel mean & std in sRGB.
-                    Fastest; good for simple gain/offset shifts.
-    histogram     — Full per-channel histogram matching (most aggressive).
-                    Best for complex, non-linear colour distributions.
+    Method guide
+    ------------
+    No extra dependencies:
+        mkl           — Full 3x3 cross-channel Lab transform (MKL).
+                        Recommended default — best quality with no extra deps.
+        reinhard_lab  — Per-channel mean/std in Lab.  Good starting point.
+        linear_rgb    — Per-channel gain/offset in sRGB.  Fastest.
+        histogram     — Per-channel CDF matching.  Good for non-linear shifts.
+
+    Requires kornia  (pip install kornia):
+        reinhard_lab_gpu  — Same as reinhard_lab but GPU-accelerated.
+
+    Requires color-matcher  (pip install color-matcher):
+        hm-mkl-hm     — HM -> MKL -> HM compound.  Best overall quality.
+        hm-mvgd-hm    — HM -> MVGD -> HM compound.
+        hm            — Histogram matching.
+        mvgd          — Multi-Variate Gaussian Distribution transfer.
     """
 
-    METHODS     = ["reinhard_lab", "linear_rgb", "histogram"]
+    METHODS = [
+        "mkl",
+        "reinhard_lab",
+        "linear_rgb",
+        "histogram",
+        "reinhard_lab_gpu",
+        "hm-mkl-hm",
+        "hm-mvgd-hm",
+        "hm",
+        "mvgd",
+    ]
     PROPAGATION = ["uniform", "falloff"]
 
     @classmethod
@@ -232,12 +419,12 @@ class ChromaPin:
                     {
                         "default": 0, "min": 0, "max": 9999,
                         "tooltip": (
-                            "0-based index of the frame in the *video* batch that "
-                            "corresponds to the reference_image you are feeding in."
+                            "0-based index of the frame in the video batch that "
+                            "corresponds to the reference_image."
                         ),
                     },
                 ),
-                "method": (cls.METHODS, {"default": "reinhard_lab"}),
+                "method": (cls.METHODS, {"default": "mkl"}),
                 "strength": (
                     "FLOAT",
                     {
@@ -250,8 +437,8 @@ class ChromaPin:
                     {
                         "default": "uniform",
                         "tooltip": (
-                            "uniform  = same correction every frame.\n"
-                            "falloff  = correction tapers with distance from the anchor frame."
+                            "uniform = same correction every frame.\n"
+                            "falloff = correction tapers with distance from the anchor frame."
                         ),
                     },
                 ),
@@ -262,8 +449,8 @@ class ChromaPin:
                     {
                         "default": 30, "min": 1, "max": 9999,
                         "tooltip": (
-                            "[falloff mode] Number of frames away from the reference "
-                            "frame at which the correction reaches zero."
+                            "[falloff mode] Frames from the reference frame at which "
+                            "correction strength reaches zero."
                         ),
                     },
                 ),
@@ -296,7 +483,6 @@ class ChromaPin:
 
     @staticmethod
     def _frame_np(video: torch.Tensor, index: int) -> np.ndarray:
-        """Return frame at index as (H, W, 3) float32 numpy [0,1]."""
         index = min(index, video.shape[0] - 1)
         return video[index].cpu().float().numpy()[..., :3]
 
@@ -313,13 +499,9 @@ class ChromaPin:
     def _make_debug(ref_np: np.ndarray,
                     before_np: np.ndarray,
                     after_np: np.ndarray) -> torch.Tensor:
-        """
-        Three-panel comparison: Reference | Before (processed) | After (corrected).
-        Panels are separated by a thin white divider.
-        All panels are resized to the same height (ref height).
-        """
+        """Three-panel: Reference | Before (processed) | After (corrected)."""
         H = ref_np.shape[0]
-        # Resize panels to match reference height if needed
+
         def _resize_h(img, target_h):
             if img.shape[0] == target_h:
                 return img
@@ -330,10 +512,10 @@ class ChromaPin:
             pil = pil.resize((new_w, target_h), PILImage.LANCZOS)
             return np.array(pil).astype(np.float32) / 255.0
 
-        panels = [_resize_h(p, H) for p in [ref_np[..., :3], before_np[..., :3], after_np[..., :3]]]
-        divider = np.ones((H, 4, 3), dtype=np.float32)  # white bar
-        row = np.concatenate([panels[0], divider, panels[1], divider, panels[2]], axis=1)
-        return torch.from_numpy(row).unsqueeze(0)        # (1, H, 3W+8, 3)
+        panels  = [_resize_h(p, H) for p in [ref_np[..., :3], before_np[..., :3], after_np[..., :3]]]
+        divider = np.ones((H, 4, 3), dtype=np.float32)
+        row     = np.concatenate([panels[0], divider, panels[1], divider, panels[2]], axis=1)
+        return torch.from_numpy(row).unsqueeze(0)
 
     # ------------------------------------------------------------------
     # Main
@@ -351,7 +533,7 @@ class ChromaPin:
         falloff_gamma: float = 1.0,
     ):
         num_frames = video.shape[0]
-        ref_idx = min(reference_frame_index, num_frames - 1)
+        ref_idx    = min(reference_frame_index, num_frames - 1)
 
         if ref_idx != reference_frame_index:
             print(
@@ -360,27 +542,21 @@ class ChromaPin:
                 f"Clamped to {ref_idx}."
             )
 
-        # Processed reference frame (what the model produced at that index)
-        src_np = self._frame_np(video, ref_idx)
-
-        # Original reference image (ground-truth colors the user wants)
+        src_np  = self._frame_np(video, ref_idx)
         tgt_raw = reference_image[0].cpu().float().numpy()[..., :3]
         tgt_np  = self._resize_to_match(tgt_raw, src_np.shape[0], src_np.shape[1])
 
         print(
-            f"[FEnodes/ChromaPin] Fitting '{method}' correction from "
-            f"frame {ref_idx}  →  reference_image  "
-            f"(src shape {src_np.shape}, tgt shape {tgt_np.shape})"
+            f"[FEnodes/ChromaPin] Fitting '{method}' on anchor frame {ref_idx} "
+            f"(src {src_np.shape}, tgt {tgt_np.shape})"
         )
 
-        # Fit the correction on the anchor pair
         fit_fn, apply_fn = _METHOD_MAP[method]
         params = fit_fn(src_np, tgt_np)
 
-        # Build per-frame strength weights
         if propagation == "uniform":
             weights = [strength] * num_frames
-        else:                                         # falloff
+        else:
             weights = []
             for f in range(num_frames):
                 dist = abs(f - ref_idx)
@@ -393,9 +569,9 @@ class ChromaPin:
                     w = float(strength * (1.0 - t))
                 weights.append(w)
 
-        # Apply frame by frame
-        has_alpha     = video.shape[-1] == 4
-        out_frames    = []
+        has_alpha  = video.shape[-1] == 4
+        out_frames = []
+
         for f in range(num_frames):
             frame_np = video[f].cpu().float().numpy()
             rgb_np   = frame_np[..., :3]
@@ -409,8 +585,7 @@ class ChromaPin:
 
             if has_alpha:
                 result = np.concatenate(
-                    [corrected_rgb.astype(np.float32),
-                     frame_np[..., 3:4]],
+                    [corrected_rgb.astype(np.float32), frame_np[..., 3:4]],
                     axis=-1,
                 )
             else:
@@ -420,14 +595,13 @@ class ChromaPin:
 
         corrected_video = torch.stack(out_frames, dim=0).clamp(0.0, 1.0)
 
-        # Debug panel: Reference | Before | After  (using the anchor frame)
         after_np = corrected_video[ref_idx].numpy()[..., :3]
         debug    = self._make_debug(tgt_np, src_np, after_np)
 
         print(
             f"[FEnodes/ChromaPin] Done. "
-            f"propagation={propagation}, strength={strength:.2f}, "
-            f"frames={num_frames}"
+            f"method={method}, propagation={propagation}, "
+            f"strength={strength:.2f}, frames={num_frames}"
         )
 
         return (corrected_video, debug)
@@ -443,4 +617,3 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ChromaPin": "ChromaPin 📌",
-}
