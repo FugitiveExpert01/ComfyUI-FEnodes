@@ -1,3 +1,13 @@
-torch
-numpy
-Pillow
+# FEnodes — ComfyUI custom node pack
+# Author: FugitiveExpert01
+#
+# Core dependencies (already present in any standard ComfyUI install):
+#   torch, numpy, Pillow
+#
+# Optional — install to unlock additional ChromaPin methods:
+
+# Enables: reinhard_lab_gpu  (GPU-accelerated Reinhard colour transfer)
+kornia
+
+# Enables: hm, mvgd, hm-mkl-hm, hm-mvgd-hm  (color-matcher compound methods)
+color-matcher
