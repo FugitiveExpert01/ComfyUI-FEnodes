@@ -1,6 +1,3 @@
-
-Copy
-
 """
 FEnodes — Color anchoring nodes for VFX production pipelines.
 Author: FugitiveExpert01
