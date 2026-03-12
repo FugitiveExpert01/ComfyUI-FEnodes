@@ -4,6 +4,8 @@ Author: FugitiveExpert01
 """
 import logging
 
+WEB_DIRECTORY = "./web"
+
 try:
     from .nodes_tiling import NODE_CLASS_MAPPINGS as _TILING_CLASSES
     from .nodes_tiling import NODE_DISPLAY_NAME_MAPPINGS as _TILING_NAMES
