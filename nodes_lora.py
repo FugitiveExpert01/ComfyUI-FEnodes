@@ -13,7 +13,7 @@ FELoraLoad has a custom JS UI (web/js/fe_power_lora.js) providing:
   • Optional separate CLIP strength (right-click node)
 """
  
-__version__ = "0.0.5"
+__version__ = "0.0.6"
  
 import json
 import logging
@@ -36,20 +36,138 @@ FE_LORA_STACK = "FE_LORA_STACK"
 _lora_weight_cache: dict[str, dict] = {}
  
 # ---------------------------------------------------------------------------
-# API route — supplies lora file list to the JS frontend
+# API routes
 # ---------------------------------------------------------------------------
 try:
+    import hashlib
+    import os
+    import requests as _requests
     from server import PromptServer
     from aiohttp import web as _web
  
+    # ── /fenodes/loras — flat file list for the JS browser ────────────────
     @PromptServer.instance.routes.get("/fenodes/loras")
     async def _fenodes_get_loras(request):
         loras = folder_paths.get_filename_list("loras")
         return _web.json_response({"loras": loras})
  
-    logger.info("[FEnodes] Registered /fenodes/loras API route.")
+    # ── /fenodes/lora_info — CivitAI + metadata info for one LoRA ────────
+    def _sha256(file_path: str) -> str:
+        h = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(131072), b""):
+                h.update(chunk)
+        return h.hexdigest()
+ 
+    def _read_safetensors_metadata(file_path: str) -> dict:
+        """Read the __metadata__ block from a .safetensors header."""
+        try:
+            with open(file_path, "rb") as f:
+                header_size = int.from_bytes(f.read(8), "little", signed=False)
+                if header_size <= 0 or header_size > 100_000_000:
+                    return {}
+                header = json.loads(f.read(header_size))
+                meta = header.get("__metadata__", {})
+                # Parse any JSON-string values
+                for k, v in meta.items():
+                    if isinstance(v, str) and v.startswith("{"):
+                        try:
+                            meta[k] = json.loads(v)
+                        except Exception:
+                            pass
+                return meta
+        except Exception as e:
+            logger.warning(f"[FEnodes/lora_info] Failed to read metadata: {e}")
+            return {}
+ 
+    @PromptServer.instance.routes.get("/fenodes/lora_info")
+    async def _fenodes_lora_info(request):
+        lora_name = request.rel_url.query.get("name", "")
+        refresh   = request.rel_url.query.get("refresh", "false").lower() == "true"
+ 
+        if not lora_name:
+            return _web.json_response({"error": "missing name"}, status=400)
+ 
+        lora_path = folder_paths.get_full_path("loras", lora_name)
+        if not lora_path or not os.path.isfile(lora_path):
+            return _web.json_response({"error": "file not found"}, status=404)
+ 
+        cache_path = os.path.splitext(lora_path)[0] + ".fe-info.json"
+ 
+        # Load cache if it exists and refresh not requested
+        cached = {}
+        if os.path.isfile(cache_path) and not refresh:
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                logger.info(f"[FEnodes/lora_info] Cache hit: {lora_name}")
+                return _web.json_response(cached)
+            except Exception:
+                pass
+ 
+        logger.info(f"[FEnodes/lora_info] Building info for: {lora_name}")
+ 
+        info = {"file": lora_name}
+ 
+        # Safetensors header metadata
+        if lora_path.endswith(".safetensors"):
+            meta = _read_safetensors_metadata(lora_path)
+            if meta:
+                info["metadata"] = meta
+                # Pull out common fields
+                for field in ("ss_sd_model_name", "ss_base_model_version",
+                              "ss_network_module", "ss_num_train_images",
+                              "modelspec.title", "modelspec.architecture"):
+                    if field in meta:
+                        info[field] = meta[field]
+ 
+        # CivitAI lookup via SHA256
+        try:
+            file_hash = _sha256(lora_path)
+            info["sha256"] = file_hash
+            civitai_url = f"https://civitai.com/api/v1/model-versions/by-hash/{file_hash}"
+            logger.info(f"[FEnodes/lora_info] Querying CivitAI: {civitai_url}")
+            resp = _requests.get(civitai_url, timeout=10)
+            if resp.status_code == 200:
+                cdata = resp.json()
+                info["civitai"] = {
+                    "name":          cdata.get("model", {}).get("name", ""),
+                    "versionName":   cdata.get("name", ""),
+                    "baseModel":     cdata.get("baseModel", ""),
+                    "modelId":       cdata.get("modelId"),
+                    "versionId":     cdata.get("id"),
+                    "trainedWords":  cdata.get("trainedWords", []),
+                    "description":   cdata.get("description", ""),
+                    "url": (
+                        f"https://civitai.com/models/{cdata.get('modelId')}"
+                        f"?modelVersionId={cdata.get('id')}"
+                        if cdata.get("modelId") else ""
+                    ),
+                    "images": [
+                        {"url": img.get("url"), "nsfw": img.get("nsfwLevel", 0)}
+                        for img in cdata.get("images", [])[:3]
+                    ],
+                }
+            elif resp.status_code == 404:
+                info["civitai"] = {"error": "not found on CivitAI"}
+            else:
+                info["civitai"] = {"error": f"CivitAI returned {resp.status_code}"}
+        except Exception as e:
+            logger.warning(f"[FEnodes/lora_info] CivitAI fetch failed: {e}")
+            info["civitai"] = {"error": str(e)}
+ 
+        # Save cache
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(info, f, indent=2)
+        except Exception as e:
+            logger.warning(f"[FEnodes/lora_info] Could not write cache: {e}")
+ 
+        return _web.json_response(info)
+ 
+    logger.info("[FEnodes] Registered /fenodes/loras and /fenodes/lora_info API routes.")
 except Exception as _e:
-    logger.warning(f"[FEnodes] Could not register /fenodes/loras route: {_e}")
+    logger.warning(f"[FEnodes] Could not register API routes: {_e}")
  
  
 # ---------------------------------------------------------------------------
@@ -161,18 +279,80 @@ class FELoraLoad:
 # SimpleTuner, etc.) without requiring model-specific knowledge.
 # ---------------------------------------------------------------------------
 def _merge_lora_weights(lora_stack: list) -> dict:
-    merged: dict = {}
+    """
+    Merge all LoRAs in the stack into a single synthetic weight dict by
+    concatenating lora_down / lora_up tensors along the rank dimension,
+    with per-LoRA strength and alpha baked in via sqrt-scaling.
+ 
+    Mathematical guarantee:
+        combined_up @ combined_down = Σ strength_i * alpha_scale_i * (up_i @ down_i)
+ 
+    This preserves the lora_down / lora_up format that comfy.sd.load_lora_for_models
+    expects, so the merged dict can be applied in a single patcher call at
+    strength_model=1.0 / strength_clip=1.0.
+ 
+    Layers that appear in only one LoRA pass through unchanged (no concat overhead).
+    Layers where ranks differ (shape mismatch) fall back gracefully with a warning.
+    """
+    staging: dict = {}  # base_key → {"downs": [], "ups": []}
+ 
     for entry in lora_stack:
-        sm = entry["strength_model"]
-        sc = entry["strength_clip"]
-        for key, tensor in entry["weights"].items():
-            strength = sc if "lora_te" in key else sm
-            scaled = tensor.float() * strength
-            if key in merged:
-                merged[key] = merged[key] + scaled
-            else:
-                merged[key] = scaled
-    return merged
+        weights        = entry["weights"]
+        strength_model = entry["strength_model"]
+        strength_clip  = entry["strength_clip"]
+ 
+        for down_key in (k for k in weights if k.endswith(".lora_down.weight")):
+            base_key = down_key[: -len(".lora_down.weight")]
+            up_key   = base_key + ".lora_up.weight"
+            if up_key not in weights:
+                continue
+ 
+            down = weights[down_key].float()
+            up   = weights[up_key].float()
+ 
+            # Alpha scale: alpha/rank if present, else 1.0
+            alpha_key   = base_key + ".alpha"
+            rank        = down.shape[0]
+            alpha_scale = float(weights[alpha_key]) / rank if alpha_key in weights else 1.0
+ 
+            # Text-encoder keys use strength_clip; everything else strength_model.
+            # Covers all major training conventions (Kohya SD1/SDXL/Flux, SimpleTuner).
+            is_te    = any(f in base_key for f in ("lora_te", "lora_te1", "lora_te2"))
+            strength = strength_clip if is_te else strength_model
+ 
+            # Bake strength + alpha into the matrices via sqrt-scaling so that
+            # (scale*up) @ (scale*down) = strength * alpha_scale * up @ down.
+            # Sign carried on `up` so the combined product has the correct sign.
+            scale = (abs(strength) * alpha_scale) ** 0.5
+            sign  = 1.0 if strength >= 0 else -1.0
+ 
+            if base_key not in staging:
+                staging[base_key] = {"downs": [], "ups": []}
+            staging[base_key]["downs"].append(down * scale)
+            staging[base_key]["ups"].append(up * scale * sign)
+ 
+    combined: dict = {}
+    for base_key, parts in staging.items():
+        downs, ups = parts["downs"], parts["ups"]
+        if len(downs) == 1:
+            # Only one LoRA targets this layer — no concatenation needed.
+            combined[base_key + ".lora_down.weight"] = downs[0]
+            combined[base_key + ".lora_up.weight"]   = ups[0]
+        else:
+            try:
+                # Linear: down=(rank, in_features),  up=(out_features, rank)
+                # Conv:   down=(rank, in_ch, kH, kW), up=(out_ch, rank, 1, 1)
+                combined[base_key + ".lora_down.weight"] = torch.cat(downs, dim=0)
+                combined[base_key + ".lora_up.weight"]   = torch.cat(ups,   dim=1)
+            except Exception as e:
+                logger.warning(
+                    f"[FEnodes/FEApplyLora] Merge: shape mismatch on '{base_key}' — "
+                    f"falling back to first LoRA only. ({e})"
+                )
+                combined[base_key + ".lora_down.weight"] = downs[0]
+                combined[base_key + ".lora_up.weight"]   = ups[0]
+ 
+    return combined
  
  
 # ---------------------------------------------------------------------------
@@ -643,3 +823,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FEApplyLora":           "Apply LoRA ⚡",
     "FELoraTriggerAnalysis": "LoRA Trigger Analysis 🔍",
 }
+ 
