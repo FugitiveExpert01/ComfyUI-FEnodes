@@ -192,11 +192,6 @@ Load Video → TileSplit → [K-Sampler per tile] → TileMerge
           → ChromaPin (+ reference frame) → Save Video
 ```
  
-**Video upscaling:**
-```
-Load Video → Video Upscale With Model → [Free Video Memory] → Save Video
-```
- 
 **LoRA workflow:**
 ```
 Load Checkpoint → LoRA Load → Apply LoRA → [K-Sampler] → Save
@@ -206,7 +201,7 @@ Load Checkpoint → LoRA Load → Apply LoRA → [K-Sampler] → Save
 **Combined:**
 ```
 Load Video → TileSplit → [K-Sampler per tile] → TileMerge
-          → ChromaPin → Video Upscale With Model → Free Video Memory → Save Video
+          → ChromaPin 
 ```
  
 ---
