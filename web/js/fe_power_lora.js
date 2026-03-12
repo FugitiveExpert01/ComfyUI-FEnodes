@@ -1,12 +1,12 @@
 /**
- * FEnodes — Power LoRA Load custom widget
+ * FEnodes -- Power LoRA Load custom widget
  * Author: FugitiveExpert01
  *
  * Replaces the raw `loras_json` textarea with a proper UI:
- *   • Folder-tree browser dropdown with search
- *   • Per-row: on/off toggle, LoRA selector, strength input, delete
- *   • "+ Add LoRA" button
- *   • Separate model / clip strength toggle (right-click node → Properties)
+ *   * Folder-tree browser dropdown with search
+ *   * Per-row: on/off toggle, LoRA selector, strength input, delete
+ *   * "+ Add LoRA" button
+ *   * Separate model / clip strength toggle (right-click node -> Properties)
  *
  * State is serialised as JSON back into the hidden `loras_json` widget so
  * ComfyUI's normal workflow save/load handles everything automatically.
@@ -15,7 +15,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
  
-// ─── Folder tree builder ──────────────────────────────────────────────────
+// --- Folder tree builder --------------------------------------------------
  
 /**
  * Turn a flat list like ["char/alice.safetensors", "style/oil.safetensors"]
@@ -38,7 +38,7 @@ function buildTree(loras) {
     return root;
 }
  
-// ─── Shared lora list (fetched once, shared across all nodes) ─────────────
+// --- Shared lora list (fetched once, shared across all nodes) -------------
  
 let _loraListPromise = null;
  
@@ -56,7 +56,7 @@ async function getLoraList() {
     return _loraListPromise;
 }
  
-// ─── CSS injected once ────────────────────────────────────────────────────
+// --- CSS injected once ----------------------------------------------------
  
 const STYLE_ID = "fenodes-power-lora-style";
 if (!document.getElementById(STYLE_ID)) {
@@ -134,7 +134,7 @@ if (!document.getElementById(STYLE_ID)) {
         }
         .fe-plora-add:hover { border-color: #5aaa5a; color: #8aca8a; background: #22341e; }
  
-        /* ── Browser panel ── */
+        /* -- Browser panel -- */
         .fe-lora-browser {
             position: fixed;
             background: #1a1a1a;
@@ -198,7 +198,7 @@ if (!document.getElementById(STYLE_ID)) {
     document.head.appendChild(s);
 }
  
-// ─── Active browser panel (only one at a time) ────────────────────────────
+// --- Active browser panel (only one at a time) ----------------------------
  
 let _activeBrowser = null;
  
@@ -227,7 +227,7 @@ function openBrowser(anchorEl, currentFull, allLoras, onSelect) {
     searchWrap.className = "fe-lora-browser-search";
     const searchInput = document.createElement("input");
     searchInput.type = "text";
-    searchInput.placeholder = "🔍  search…";
+    searchInput.placeholder = "  search...";
     searchWrap.appendChild(searchInput);
     panel.appendChild(searchWrap);
  
@@ -236,7 +236,7 @@ function openBrowser(anchorEl, currentFull, allLoras, onSelect) {
     listEl.className = "fe-lora-browser-list";
     panel.appendChild(listEl);
  
-    // ── Tree renderer ───────────────────────────────────────────────────
+    // -- Tree renderer ---------------------------------------------------
  
     /**
      * Render a tree node into a DocumentFragment.
@@ -270,7 +270,7 @@ function openBrowser(anchorEl, currentFull, allLoras, onSelect) {
                 if (!childFrag.childNodes.length) continue;
                 const header = document.createElement("div");
                 header.className = "fe-lora-folder-header";
-                header.innerHTML = `<span>📁 ${folderName}</span>`;
+                header.innerHTML = `<span> ${folderName}</span>`;
                 frag.appendChild(header);
                 const childDiv = document.createElement("div");
                 childDiv.className = "fe-lora-folder-children";
@@ -283,10 +283,10 @@ function openBrowser(anchorEl, currentFull, allLoras, onSelect) {
                 header.className = "fe-lora-folder-header";
                 const arrow = document.createElement("span");
                 arrow.className = "fe-lora-folder-arrow";
-                arrow.textContent = expanded ? "▼" : "▶";
+                arrow.textContent = expanded ? "v" : ">";
                 header.appendChild(arrow);
                 const label = document.createElement("span");
-                label.textContent = "📁 " + folderName;
+                label.textContent = " " + folderName;
                 header.appendChild(label);
  
                 const childDiv = document.createElement("div");
@@ -296,7 +296,7 @@ function openBrowser(anchorEl, currentFull, allLoras, onSelect) {
  
                 header.addEventListener("click", () => {
                     expanded = !expanded;
-                    arrow.textContent = expanded ? "▼" : "▶";
+                    arrow.textContent = expanded ? "v" : ">";
                     childDiv.style.display = expanded ? "block" : "none";
                 });
  
@@ -347,7 +347,7 @@ function openBrowser(anchorEl, currentFull, allLoras, onSelect) {
     searchInput.focus();
 }
  
-// ─── Extension registration ───────────────────────────────────────────────
+// --- Extension registration -----------------------------------------------
  
 app.registerExtension({
     name: "FEnodes.PowerLoraLoad",
@@ -362,7 +362,7 @@ app.registerExtension({
  
             const node = this;
  
-            // ── Find and hide the raw loras_json widget ─────────────────
+            // -- Find and hide the raw loras_json widget -----------------
             const jsonWidget = node.widgets?.find(w => w.name === "loras_json");
             if (jsonWidget) {
                 // Remove it from visual sizing but keep it for serialisation
@@ -371,7 +371,7 @@ app.registerExtension({
                 jsonWidget.draw = () => {};
             }
  
-            // ── Parse existing saved state ───────────────────────────────
+            // -- Parse existing saved state -------------------------------
             let loraRows = []; // [{ enabled, lora, strength_model, strength_clip }]
             if (jsonWidget?.value) {
                 try { loraRows = JSON.parse(jsonWidget.value); } catch {}
@@ -381,18 +381,18 @@ app.registerExtension({
             // (toggleable via node Properties panel)
             let splitStrength = false;
  
-            // ── Fetch lora list async ────────────────────────────────────
+            // -- Fetch lora list async ------------------------------------
             let allLoras = [];
             getLoraList().then(list => {
                 allLoras = list;
             });
  
-            // ── Sync state → hidden widget ───────────────────────────────
+            // -- Sync state -> hidden widget -------------------------------
             function sync() {
                 if (jsonWidget) jsonWidget.value = JSON.stringify(loraRows);
             }
  
-            // ── Build a single row element ───────────────────────────────
+            // -- Build a single row element -------------------------------
             function buildRow(entry, idx) {
                 const row = document.createElement("div");
                 row.className = "fe-plora-row";
@@ -416,7 +416,7 @@ app.registerExtension({
                 selector.style.opacity = entry.enabled !== false ? "1" : "0.4";
                 selector.textContent = entry.lora
                     ? entry.lora.split("/").pop().replace(/\.(safetensors|pt|ckpt)$/i, "")
-                    : "— select lora —";
+                    : "-- select lora --";
                 selector.title = entry.lora || "Click to choose a LoRA";
                 selector.addEventListener("click", (e) => {
                     e.stopPropagation();
@@ -472,7 +472,7 @@ app.registerExtension({
                 // Delete
                 const del = document.createElement("button");
                 del.className = "fe-plora-del";
-                del.textContent = "✕";
+                del.textContent = "x";
                 del.title = "Remove this LoRA";
                 del.addEventListener("click", () => {
                     loraRows.splice(idx, 1);
@@ -488,7 +488,7 @@ app.registerExtension({
                 return row;
             }
  
-            // ── Container ────────────────────────────────────────────────
+            // -- Container ------------------------------------------------
             const container = document.createElement("div");
             container.style.cssText = "width:100%; padding:4px; box-sizing:border-box;";
  
@@ -518,7 +518,7 @@ app.registerExtension({
                 } catch {}
             }
  
-            // ── Add DOM widget ───────────────────────────────────────────
+            // -- Add DOM widget -------------------------------------------
             node.addDOMWidget("power_loras_ui", "FEPowerLorasUI", container, {
                 getValue: () => JSON.stringify(loraRows),
                 setValue: (v) => {
@@ -533,13 +533,13 @@ app.registerExtension({
  
             renderAll();
  
-            // ── Expose splitStrength toggle via context menu ──────────────
+            // -- Expose splitStrength toggle via context menu --------------
             const origGetExtraMenuOptions = node.getExtraMenuOptions?.bind(node);
             node.getExtraMenuOptions = function(_, options) {
                 origGetExtraMenuOptions?.(_, options);
                 options.push({
                     content: splitStrength
-                        ? "✔ Separate CLIP strength (on)"
+                        ? "[x] Separate CLIP strength (on)"
                         : "  Separate CLIP strength (off)",
                     callback: () => {
                         splitStrength = !splitStrength;
