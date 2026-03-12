@@ -12,8 +12,8 @@
  * ComfyUI's normal workflow save/load handles everything automatically.
  */
  
-import { app } from "../../scripts/app.js";
-import { api } from "../../scripts/api.js";
+import { app } from "../../../scripts/app.js";
+import { api } from "../../../scripts/api.js";
  
 // --- Folder tree builder --------------------------------------------------
  
