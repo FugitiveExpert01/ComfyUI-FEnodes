@@ -2,25 +2,22 @@
  * FEnodes -- Power LoRA Load custom widget
  * Author: FugitiveExpert01
  *
- * Replaces the raw `loras_json` textarea with a proper UI:
- *   * Folder-tree browser dropdown with search
- *   * Per-row: on/off toggle, LoRA selector, strength input, delete
- *   * "+ Add LoRA" button
- *   * Separate model / clip strength toggle (right-click node -> Properties)
- *
- * State is serialised as JSON back into the hidden `loras_json` widget so
- * ComfyUI's normal workflow save/load handles everything automatically.
+ * Features:
+ *   - Folder-tree browser with search
+ *   - Per-row on/off toggle, strength input (+ optional separate CLIP strength)
+ *   - Drag-and-drop row reordering
+ *   - Right-click row -> LoRA info panel with CivitAI fetch
+ *   - "+ Add LoRA" button
  */
  
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
  
-// --- Folder tree builder --------------------------------------------------
+console.log("[FEnodes] fe_power_lora.js: module top-level executing");
  
-/**
- * Turn a flat list like ["char/alice.safetensors", "style/oil.safetensors"]
- * into a nested tree: { files: [], children: { char: {...}, style: {...} } }
- */
+// ---------------------------------------------------------------------------
+// Folder tree builder
+// ---------------------------------------------------------------------------
 function buildTree(loras) {
     const root = { files: [], children: {} };
     for (const p of loras) {
@@ -28,9 +25,7 @@ function buildTree(loras) {
         let node = root;
         for (let i = 0; i < parts.length - 1; i++) {
             const seg = parts[i];
-            if (!node.children[seg]) {
-                node.children[seg] = { files: [], children: {} };
-            }
+            if (!node.children[seg]) node.children[seg] = { files: [], children: {} };
             node = node.children[seg];
         }
         node.files.push({ label: parts[parts.length - 1], full: p });
@@ -38,10 +33,10 @@ function buildTree(loras) {
     return root;
 }
  
-// --- Shared lora list (fetched once, shared across all nodes) -------------
- 
+// ---------------------------------------------------------------------------
+// Shared lora list (fetched once)
+// ---------------------------------------------------------------------------
 let _loraListPromise = null;
- 
 async function getLoraList() {
     if (!_loraListPromise) {
         _loraListPromise = api.fetchApi("/fenodes/loras")
@@ -49,15 +44,16 @@ async function getLoraList() {
             .then(d => d.loras ?? [])
             .catch(e => {
                 console.warn("[FEnodes/PowerLoRA] Failed to fetch lora list:", e);
-                _loraListPromise = null; // allow retry
+                _loraListPromise = null;
                 return [];
             });
     }
     return _loraListPromise;
 }
  
-// --- CSS injected once ----------------------------------------------------
- 
+// ---------------------------------------------------------------------------
+// CSS (injected once)
+// ---------------------------------------------------------------------------
 const STYLE_ID = "fenodes-power-lora-style";
 if (!document.getElementById(STYLE_ID)) {
     const s = document.createElement("style");
@@ -72,8 +68,22 @@ if (!document.getElementById(STYLE_ID)) {
             border-radius: 4px;
             padding: 3px 5px;
             min-height: 26px;
+            cursor: default;
         }
         .fe-plora-row:hover { background: #2c2c2c; }
+        .fe-plora-row.fe-drag-over { outline: 1px dashed #5a9a5a; background: #1e2e1e; }
+        .fe-plora-row.fe-dragging  { opacity: 0.4; }
+ 
+        .fe-plora-handle {
+            flex-shrink: 0;
+            cursor: grab;
+            color: #555;
+            font-size: 13px;
+            padding: 0 2px;
+            user-select: none;
+        }
+        .fe-plora-handle:hover { color: #888; }
+ 
         .fe-plora-toggle {
             cursor: pointer;
             accent-color: #5a9a5a;
@@ -130,11 +140,10 @@ if (!document.getElementById(STYLE_ID)) {
             padding: 4px;
             cursor: pointer;
             font-size: 11px;
-            transition: border-color 0.15s;
         }
         .fe-plora-add:hover { border-color: #5aaa5a; color: #8aca8a; background: #22341e; }
  
-        /* -- Browser panel -- */
+        /* -- Lora browser panel -- */
         .fe-lora-browser {
             position: fixed;
             background: #1a1a1a;
@@ -148,136 +157,142 @@ if (!document.getElementById(STYLE_ID)) {
             box-shadow: 0 6px 24px rgba(0,0,0,0.7);
             overflow: hidden;
         }
-        .fe-lora-browser-search {
-            padding: 6px;
-            border-bottom: 1px solid #2e2e2e;
-            flex-shrink: 0;
-        }
+        .fe-lora-browser-search { padding: 6px; border-bottom: 1px solid #2e2e2e; flex-shrink: 0; }
         .fe-lora-browser-search input {
-            width: 100%;
-            box-sizing: border-box;
-            background: #252525;
-            border: 1px solid #4a4a4a;
-            color: #ccc;
-            border-radius: 4px;
-            padding: 4px 8px;
-            font-size: 12px;
+            width: 100%; box-sizing: border-box;
+            background: #252525; border: 1px solid #4a4a4a; color: #ccc;
+            border-radius: 4px; padding: 4px 8px; font-size: 12px;
         }
         .fe-lora-browser-search input:focus { border-color: #6ab; outline: none; }
-        .fe-lora-browser-list {
-            overflow-y: auto;
-            flex: 1;
-            padding: 4px 0;
-        }
+        .fe-lora-browser-list { overflow-y: auto; flex: 1; padding: 4px 0; }
         .fe-lora-folder-header {
-            display: flex;
-            align-items: center;
-            gap: 5px;
-            padding: 4px 10px;
-            cursor: pointer;
-            color: #999;
-            font-size: 11px;
-            font-weight: 600;
-            user-select: none;
+            display: flex; align-items: center; gap: 5px;
+            padding: 4px 10px; cursor: pointer; color: #999;
+            font-size: 11px; font-weight: 600; user-select: none;
         }
         .fe-lora-folder-header:hover { color: #bbb; background: #222; }
-        .fe-lora-folder-arrow { font-size: 9px; transition: transform 0.1s; }
+        .fe-lora-folder-arrow { font-size: 9px; }
         .fe-lora-folder-children { padding-left: 12px; }
         .fe-lora-file {
-            padding: 3px 10px;
-            cursor: pointer;
-            color: #c0c0c0;
-            font-size: 11px;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
+            padding: 3px 10px; cursor: pointer; color: #c0c0c0;
+            font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         }
         .fe-lora-file:hover { background: #2a2a2a; color: #fff; }
         .fe-lora-file.selected { color: #7bf; font-weight: 600; }
+ 
+        /* -- Info panel -- */
+        .fe-lora-info-panel {
+            position: fixed;
+            background: #1a1a1a;
+            border: 1px solid #4a4a4a;
+            border-radius: 6px;
+            z-index: 100001;
+            width: 280px;
+            max-height: 420px;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 6px 24px rgba(0,0,0,0.8);
+            overflow: hidden;
+            font-size: 11px;
+            color: #ccc;
+        }
+        .fe-lora-info-header {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 7px 10px; background: #222; border-bottom: 1px solid #333;
+            font-weight: 600; font-size: 12px; flex-shrink: 0;
+        }
+        .fe-lora-info-close {
+            background: none; border: none; color: #888;
+            cursor: pointer; font-size: 14px; padding: 0 2px; line-height: 1;
+        }
+        .fe-lora-info-close:hover { color: #c66; }
+        .fe-lora-info-body { overflow-y: auto; flex: 1; padding: 8px 10px; }
+        .fe-lora-info-row { margin-bottom: 6px; }
+        .fe-lora-info-label { color: #888; font-size: 10px; text-transform: uppercase; margin-bottom: 2px; }
+        .fe-lora-info-value { color: #ddd; word-break: break-word; }
+        .fe-lora-info-words {
+            display: flex; flex-wrap: wrap; gap: 3px; margin-top: 2px;
+        }
+        .fe-lora-info-word {
+            background: #2a3a2a; border: 1px solid #3a6a3a; color: #8ccc8c;
+            border-radius: 3px; padding: 1px 5px; cursor: pointer; font-size: 10px;
+        }
+        .fe-lora-info-word:hover { background: #334a33; }
+        .fe-lora-info-word.copied { background: #3a5a3a; color: #aeeaae; }
+        .fe-lora-info-link { color: #7af; text-decoration: none; font-size: 10px; }
+        .fe-lora-info-link:hover { text-decoration: underline; }
+        .fe-lora-info-footer {
+            padding: 6px 10px; border-top: 1px solid #2a2a2a;
+            display: flex; gap: 6px; flex-shrink: 0;
+        }
+        .fe-lora-info-btn {
+            flex: 1; background: #1e2e1e; border: 1px solid #3a6a3a;
+            color: #6aaa6a; border-radius: 4px; padding: 4px 6px;
+            cursor: pointer; font-size: 11px;
+        }
+        .fe-lora-info-btn:hover { background: #22341e; border-color: #5aaa5a; }
+        .fe-lora-info-btn.loading { color: #888; border-color: #444; cursor: wait; }
+        .fe-lora-info-spinner { display: inline-block; animation: fe-spin 0.8s linear infinite; }
+        @keyframes fe-spin { to { transform: rotate(360deg); } }
+        .fe-lora-info-error { color: #c88; font-size: 11px; padding: 4px 0; }
     `;
     document.head.appendChild(s);
 }
  
-// --- Active browser panel (only one at a time) ----------------------------
- 
+// ---------------------------------------------------------------------------
+// Active floating panels (one browser, one info panel at a time)
+// ---------------------------------------------------------------------------
 let _activeBrowser = null;
+let _activeInfoPanel = null;
  
-function closeBrowser() {
-    _activeBrowser?.remove();
-    _activeBrowser = null;
-}
+function closeBrowser() { _activeBrowser?.remove(); _activeBrowser = null; }
+function closeInfoPanel() { _activeInfoPanel?.remove(); _activeInfoPanel = null; }
  
-/**
- * Open the folder-tree browser near `anchorEl`.
- * @param {HTMLElement} anchorEl  Element to anchor below/above.
- * @param {string}      currentFull  Currently selected lora full path (for highlight).
- * @param {string[]}    allLoras  Flat list of all lora paths.
- * @param {function}    onSelect  Called with chosen full path string.
- */
+// ---------------------------------------------------------------------------
+// Folder-tree browser
+// ---------------------------------------------------------------------------
 function openBrowser(anchorEl, currentFull, allLoras, onSelect) {
     closeBrowser();
- 
     const tree = buildTree(allLoras);
- 
     const panel = document.createElement("div");
     panel.className = "fe-lora-browser";
  
-    // Search bar
     const searchWrap = document.createElement("div");
     searchWrap.className = "fe-lora-browser-search";
     const searchInput = document.createElement("input");
     searchInput.type = "text";
-    searchInput.placeholder = "  search...";
+    searchInput.placeholder = "search...";
     searchWrap.appendChild(searchInput);
     panel.appendChild(searchWrap);
  
-    // Scrollable list
     const listEl = document.createElement("div");
     listEl.className = "fe-lora-browser-list";
     panel.appendChild(listEl);
  
-    // -- Tree renderer ---------------------------------------------------
- 
-    /**
-     * Render a tree node into a DocumentFragment.
-     * @param {object} node  Tree node { files, children }.
-     * @param {string} filter  Lowercase search string, or null for no filter.
-     * @param {boolean} startExpanded  Whether folders start open (true when filtering).
-     */
     function renderNode(node, filter, startExpanded) {
         const frag = document.createDocumentFragment();
- 
-        // Files in this node
         for (const f of node.files) {
             if (filter && !f.full.toLowerCase().includes(filter)) continue;
             const item = document.createElement("div");
             item.className = "fe-lora-file" + (f.full === currentFull ? " selected" : "");
-            // Show just the filename without extension
             item.textContent = f.label.replace(/\.(safetensors|pt|ckpt)$/i, "");
             item.title = f.full;
-            item.addEventListener("click", () => {
-                onSelect(f.full);
-                closeBrowser();
-            });
+            item.addEventListener("click", () => { onSelect(f.full); closeBrowser(); });
             frag.appendChild(item);
         }
- 
-        // Subfolders
         for (const [folderName, child] of Object.entries(node.children)) {
-            // When filtering: only show folder if it has matching descendants
             if (filter) {
                 const childFrag = renderNode(child, filter, true);
                 if (!childFrag.childNodes.length) continue;
                 const header = document.createElement("div");
                 header.className = "fe-lora-folder-header";
-                header.innerHTML = `<span> ${folderName}</span>`;
+                header.innerHTML = `<span>[+] ${folderName}</span>`;
                 frag.appendChild(header);
                 const childDiv = document.createElement("div");
                 childDiv.className = "fe-lora-folder-children";
                 childDiv.appendChild(childFrag);
                 frag.appendChild(childDiv);
             } else {
-                // Collapsible folder
                 let expanded = startExpanded;
                 const header = document.createElement("div");
                 header.className = "fe-lora-folder-header";
@@ -286,25 +301,21 @@ function openBrowser(anchorEl, currentFull, allLoras, onSelect) {
                 arrow.textContent = expanded ? "v" : ">";
                 header.appendChild(arrow);
                 const label = document.createElement("span");
-                label.textContent = " " + folderName;
+                label.textContent = " [folder] " + folderName;
                 header.appendChild(label);
- 
                 const childDiv = document.createElement("div");
                 childDiv.className = "fe-lora-folder-children";
                 childDiv.style.display = expanded ? "block" : "none";
                 childDiv.appendChild(renderNode(child, null, false));
- 
                 header.addEventListener("click", () => {
                     expanded = !expanded;
                     arrow.textContent = expanded ? "v" : ">";
                     childDiv.style.display = expanded ? "block" : "none";
                 });
- 
                 frag.appendChild(header);
                 frag.appendChild(childDiv);
             }
         }
- 
         return frag;
     }
  
@@ -322,19 +333,15 @@ function openBrowser(anchorEl, currentFull, allLoras, onSelect) {
  
     searchInput.addEventListener("input", () => rebuildList(searchInput.value));
     rebuildList("");
- 
     document.body.appendChild(panel);
     _activeBrowser = panel;
  
-    // Position: below anchor, or above if near bottom of viewport
     const rect = anchorEl.getBoundingClientRect();
-    const panelH = 360;
     const spaceBelow = window.innerHeight - rect.bottom;
-    const top = spaceBelow >= panelH ? rect.bottom + 2 : rect.top - panelH - 2;
+    const top = spaceBelow >= 360 ? rect.bottom + 2 : rect.top - 362;
     panel.style.left = Math.max(0, Math.min(rect.left, window.innerWidth - 304)) + "px";
     panel.style.top  = Math.max(0, top) + "px";
  
-    // Close on outside click (deferred so the triggering click doesn't immediately close)
     setTimeout(() => {
         document.addEventListener("mousedown", function outsideHandler(ev) {
             if (!panel.contains(ev.target)) {
@@ -343,14 +350,186 @@ function openBrowser(anchorEl, currentFull, allLoras, onSelect) {
             }
         });
     }, 10);
- 
     searchInput.focus();
 }
  
-// --- Extension registration -----------------------------------------------
+// ---------------------------------------------------------------------------
+// LoRA info panel
+// ---------------------------------------------------------------------------
+async function openInfoPanel(anchorEl, loraName, onRefresh) {
+    closeInfoPanel();
+    if (!loraName) return;
  
-console.log("[FEnodes] fe_power_lora.js: module top-level executing");
+    const panel = document.createElement("div");
+    panel.className = "fe-lora-info-panel";
+    _activeInfoPanel = panel;
  
+    // Header
+    const header = document.createElement("div");
+    header.className = "fe-lora-info-header";
+    const title = document.createElement("span");
+    title.textContent = loraName.split("/").pop().replace(/\.(safetensors|pt|ckpt)$/i, "");
+    title.style.cssText = "overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:220px;";
+    title.title = loraName;
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "fe-lora-info-close";
+    closeBtn.textContent = "x";
+    closeBtn.addEventListener("click", closeInfoPanel);
+    header.appendChild(title);
+    header.appendChild(closeBtn);
+    panel.appendChild(header);
+ 
+    // Body
+    const body = document.createElement("div");
+    body.className = "fe-lora-info-body";
+    body.textContent = "Loading...";
+    panel.appendChild(body);
+ 
+    // Footer
+    const footer = document.createElement("div");
+    footer.className = "fe-lora-info-footer";
+    const fetchBtn = document.createElement("button");
+    fetchBtn.className = "fe-lora-info-btn";
+    fetchBtn.textContent = "Fetch from CivitAI";
+    footer.appendChild(fetchBtn);
+    panel.appendChild(footer);
+ 
+    document.body.appendChild(panel);
+ 
+    // Position next to anchor
+    const rect = anchorEl.getBoundingClientRect();
+    const spaceRight = window.innerWidth - rect.right;
+    const left = spaceRight >= 290 ? rect.right + 4 : rect.left - 284;
+    const top  = Math.max(0, Math.min(rect.top, window.innerHeight - 420));
+    panel.style.left = Math.max(0, left) + "px";
+    panel.style.top  = top + "px";
+ 
+    // Close on outside click
+    setTimeout(() => {
+        document.addEventListener("mousedown", function outsideHandler(ev) {
+            if (!panel.contains(ev.target)) {
+                closeInfoPanel();
+                document.removeEventListener("mousedown", outsideHandler);
+            }
+        });
+    }, 10);
+ 
+    async function loadInfo(refresh) {
+        body.innerHTML = "";
+        const spinner = document.createElement("span");
+        spinner.className = "fe-lora-info-spinner";
+        spinner.textContent = "* ";
+        body.appendChild(spinner);
+        body.append("Loading...");
+        fetchBtn.className = "fe-lora-info-btn loading";
+        fetchBtn.textContent = "Fetching...";
+ 
+        let info;
+        try {
+            const url = `/fenodes/lora_info?name=${encodeURIComponent(loraName)}${refresh ? "&refresh=true" : ""}`;
+            const r = await api.fetchApi(url);
+            info = await r.json();
+        } catch (e) {
+            body.innerHTML = `<div class="fe-lora-info-error">Error: ${e.message}</div>`;
+            fetchBtn.className = "fe-lora-info-btn";
+            fetchBtn.textContent = "Retry";
+            return;
+        }
+ 
+        body.innerHTML = "";
+        fetchBtn.className = "fe-lora-info-btn";
+        fetchBtn.textContent = "Refresh from CivitAI";
+ 
+        function row(label, value) {
+            if (!value) return;
+            const d = document.createElement("div");
+            d.className = "fe-lora-info-row";
+            d.innerHTML = `<div class="fe-lora-info-label">${label}</div>
+                           <div class="fe-lora-info-value">${value}</div>`;
+            body.appendChild(d);
+        }
+ 
+        const civ = info.civitai;
+        if (civ && !civ.error) {
+            if (civ.name)        row("Name",       civ.name + (civ.versionName ? ` - ${civ.versionName}` : ""));
+            if (civ.baseModel)   row("Base model", civ.baseModel);
+            if (civ.url) {
+                const linkRow = document.createElement("div");
+                linkRow.className = "fe-lora-info-row";
+                linkRow.innerHTML = `<div class="fe-lora-info-label">CivitAI</div>`;
+                const a = document.createElement("a");
+                a.className = "fe-lora-info-link";
+                a.href = civ.url;
+                a.target = "_blank";
+                a.textContent = "Open model page";
+                linkRow.appendChild(a);
+                body.appendChild(linkRow);
+            }
+            if (civ.trainedWords?.length) {
+                const d = document.createElement("div");
+                d.className = "fe-lora-info-row";
+                d.innerHTML = `<div class="fe-lora-info-label">Trained words</div>`;
+                const words = document.createElement("div");
+                words.className = "fe-lora-info-words";
+                for (const w of civ.trainedWords) {
+                    const chip = document.createElement("span");
+                    chip.className = "fe-lora-info-word";
+                    chip.textContent = w;
+                    chip.title = "Click to copy";
+                    chip.addEventListener("click", () => {
+                        navigator.clipboard.writeText(w).catch(() => {});
+                        chip.classList.add("copied");
+                        setTimeout(() => chip.classList.remove("copied"), 1200);
+                    });
+                    words.appendChild(chip);
+                }
+                d.appendChild(words);
+                body.appendChild(d);
+            }
+        } else if (civ?.error) {
+            const d = document.createElement("div");
+            d.className = "fe-lora-info-error";
+            d.textContent = "CivitAI: " + civ.error;
+            body.appendChild(d);
+        }
+ 
+        // Metadata fields from safetensors header
+        const meta = info.metadata;
+        if (meta) {
+            const metaFields = {
+                "ss_sd_model_name":        "Base model file",
+                "ss_base_model_version":   "Base model version",
+                "ss_network_module":       "Network module",
+                "ss_num_train_images":     "Training images",
+            };
+            for (const [key, label] of Object.entries(metaFields)) {
+                if (meta[key]) row(label, String(meta[key]));
+            }
+        }
+ 
+        // SHA256
+        if (info.sha256) {
+            const d = document.createElement("div");
+            d.className = "fe-lora-info-row";
+            d.innerHTML = `<div class="fe-lora-info-label">SHA256</div>
+                           <div class="fe-lora-info-value" style="font-size:9px; color:#666; word-break:break-all;">${info.sha256}</div>`;
+            body.appendChild(d);
+        }
+ 
+        if (!body.children.length) {
+            body.textContent = "No info available. Try fetching from CivitAI.";
+        }
+ 
+        onRefresh?.(info);
+    }
+ 
+    fetchBtn.addEventListener("click", () => loadInfo(true));
+    loadInfo(false);
+}
+ 
+// ---------------------------------------------------------------------------
+// Extension registration
+// ---------------------------------------------------------------------------
 app.registerExtension({
     name: "FEnodes.PowerLoraLoad",
  
@@ -359,7 +538,6 @@ app.registerExtension({
             console.log("[FEnodes] beforeRegisterNodeDef saw:", nodeData.name);
         }
         if (nodeData.name !== "FELoraLoad") return;
- 
         console.log("[FEnodes] FELoraLoad node def found -- patching onNodeCreated");
  
         const origCreated = nodeType.prototype.onNodeCreated;
@@ -370,17 +548,15 @@ app.registerExtension({
  
             const node = this;
  
-            // -- Find and hide the raw loras_json widget -----------------
+            // Hide the raw loras_json widget
             const jsonWidget = node.widgets?.find(w => w.name === "loras_json");
-            console.log("[FEnodes] loras_json widget found:", !!jsonWidget, "| widgets:", node.widgets?.map(w => w.name));
- 
+            console.log("[FEnodes] loras_json widget found:", !!jsonWidget,
+                        "| widgets:", node.widgets?.map(w => w.name));
             if (jsonWidget) {
                 jsonWidget.computeSize = () => [0, -4];
-                const origDraw = jsonWidget.draw;
                 jsonWidget.draw = () => {};
             }
  
-            // -- Parse existing saved state -------------------------------
             let loraRows = [];
             if (jsonWidget?.value) {
                 try { loraRows = JSON.parse(jsonWidget.value); } catch {}
@@ -388,22 +564,61 @@ app.registerExtension({
  
             let splitStrength = false;
  
-            // -- Fetch lora list async ------------------------------------
             let allLoras = [];
             getLoraList().then(list => {
                 allLoras = list;
                 console.log("[FEnodes] lora list fetched, count:", allLoras.length);
             });
  
-            // -- Sync state -> hidden widget -------------------------------
             function sync() {
                 if (jsonWidget) jsonWidget.value = JSON.stringify(loraRows);
             }
  
-            // -- Build a single row element -------------------------------
+            // ----------------------------------------------------------------
+            // Drag-and-drop state
+            // ----------------------------------------------------------------
+            let dragSrcIdx = null;
+ 
+            // ----------------------------------------------------------------
+            // Build a single row
+            // ----------------------------------------------------------------
             function buildRow(entry, idx) {
                 const row = document.createElement("div");
                 row.className = "fe-plora-row";
+                row.draggable = true;
+ 
+                // Drag handle
+                const handle = document.createElement("span");
+                handle.className = "fe-plora-handle";
+                handle.textContent = "::";
+                handle.title = "Drag to reorder";
+ 
+                // Drag events
+                row.addEventListener("dragstart", (e) => {
+                    dragSrcIdx = idx;
+                    e.dataTransfer.effectAllowed = "move";
+                    // Tiny delay so the drag image renders before we dim it
+                    setTimeout(() => row.classList.add("fe-dragging"), 0);
+                });
+                row.addEventListener("dragend", () => {
+                    row.classList.remove("fe-dragging");
+                    rowsEl.querySelectorAll(".fe-plora-row").forEach(r => r.classList.remove("fe-drag-over"));
+                });
+                row.addEventListener("dragover", (e) => {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = "move";
+                    rowsEl.querySelectorAll(".fe-plora-row").forEach(r => r.classList.remove("fe-drag-over"));
+                    row.classList.add("fe-drag-over");
+                });
+                row.addEventListener("drop", (e) => {
+                    e.preventDefault();
+                    if (dragSrcIdx === null || dragSrcIdx === idx) return;
+                    const moved = loraRows.splice(dragSrcIdx, 1)[0];
+                    loraRows.splice(idx, 0, moved);
+                    dragSrcIdx = null;
+                    sync();
+                    renderAll();
+                });
  
                 // Toggle
                 const toggle = document.createElement("input");
@@ -414,11 +629,10 @@ app.registerExtension({
                 toggle.addEventListener("change", () => {
                     loraRows[idx].enabled = toggle.checked;
                     sync();
-                    // Dim the selector visually when disabled
                     selector.style.opacity = toggle.checked ? "1" : "0.4";
                 });
  
-                // Selector button
+                // Selector
                 const selector = document.createElement("button");
                 selector.className = "fe-plora-selector" + (entry.lora ? "" : " empty");
                 selector.style.opacity = entry.enabled !== false ? "1" : "0.4";
@@ -426,6 +640,7 @@ app.registerExtension({
                     ? entry.lora.split("/").pop().replace(/\.(safetensors|pt|ckpt)$/i, "")
                     : "-- select lora --";
                 selector.title = entry.lora || "Click to choose a LoRA";
+ 
                 selector.addEventListener("click", (e) => {
                     e.stopPropagation();
                     openBrowser(selector, loraRows[idx].lora, allLoras, (chosen) => {
@@ -437,7 +652,15 @@ app.registerExtension({
                     });
                 });
  
-                // Strength input(s)
+                // Right-click on row -> info panel
+                row.addEventListener("contextmenu", (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (!loraRows[idx].lora) return;
+                    openInfoPanel(row, loraRows[idx].lora);
+                });
+ 
+                // Strength inputs
                 function makeStrInput(val, title, onChange) {
                     const inp = document.createElement("input");
                     inp.type = "number";
@@ -451,16 +674,15 @@ app.registerExtension({
                     inp.addEventListener("wheel", (e) => {
                         e.preventDefault();
                         const delta = e.deltaY < 0 ? 0.05 : -0.05;
-                        const newVal = Math.round((parseFloat(inp.value) + delta) * 100) / 100;
-                        inp.value = Math.max(-10, Math.min(10, newVal)).toFixed(2);
+                        const v = Math.round((parseFloat(inp.value) + delta) * 100) / 100;
+                        inp.value = Math.max(-10, Math.min(10, v)).toFixed(2);
                         inp.dispatchEvent(new Event("change"));
                     });
                     return inp;
                 }
  
                 const strModel = makeStrInput(
-                    entry.strength_model ?? 1.0,
-                    "Model strength",
+                    entry.strength_model ?? 1.0, "Model strength",
                     (v) => {
                         loraRows[idx].strength_model = v;
                         if (!splitStrength) loraRows[idx].strength_clip = v;
@@ -471,8 +693,7 @@ app.registerExtension({
                 let strClip = null;
                 if (splitStrength) {
                     strClip = makeStrInput(
-                        entry.strength_clip ?? entry.strength_model ?? 1.0,
-                        "CLIP strength",
+                        entry.strength_clip ?? entry.strength_model ?? 1.0, "CLIP strength",
                         (v) => { loraRows[idx].strength_clip = v; sync(); }
                     );
                 }
@@ -488,6 +709,7 @@ app.registerExtension({
                     renderAll();
                 });
  
+                row.appendChild(handle);
                 row.appendChild(toggle);
                 row.appendChild(selector);
                 row.appendChild(strModel);
@@ -496,7 +718,9 @@ app.registerExtension({
                 return row;
             }
  
-            // -- Container ------------------------------------------------
+            // ----------------------------------------------------------------
+            // Container
+            // ----------------------------------------------------------------
             const container = document.createElement("div");
             container.style.cssText = "width:100%; padding:4px; box-sizing:border-box;";
  
@@ -516,10 +740,7 @@ app.registerExtension({
  
             function renderAll() {
                 rowsEl.innerHTML = "";
-                loraRows.forEach((entry, idx) => {
-                    rowsEl.appendChild(buildRow(entry, idx));
-                });
-                // Nudge ComfyUI to reflow node size
+                loraRows.forEach((entry, idx) => rowsEl.appendChild(buildRow(entry, idx)));
                 try {
                     node.setSize([node.size[0], node.computeSize()[1]]);
                     app.graph.setDirtyCanvas(true, false);
@@ -527,29 +748,25 @@ app.registerExtension({
             }
  
             console.log("[FEnodes] About to call addDOMWidget");
-            // -- Add DOM widget -------------------------------------------
             node.addDOMWidget("power_loras_ui", "FEPowerLorasUI", container, {
                 getValue: () => JSON.stringify(loraRows),
                 setValue: (v) => {
                     try { loraRows = JSON.parse(v); } catch {}
                     renderAll();
                 },
-                getMinHeight: () => {
-                    // Approx: 30px per row + 32px for button + 12px padding
-                    return loraRows.length * 30 + 44;
-                },
+                getMinHeight: () => loraRows.length * 30 + 44,
             });
  
             renderAll();
  
-            // -- Expose splitStrength toggle via context menu --------------
+            // Node right-click -> separate CLIP strength toggle
             const origGetExtraMenuOptions = node.getExtraMenuOptions?.bind(node);
             node.getExtraMenuOptions = function(_, options) {
                 origGetExtraMenuOptions?.(_, options);
                 options.push({
                     content: splitStrength
                         ? "[x] Separate CLIP strength (on)"
-                        : "  Separate CLIP strength (off)",
+                        : "[ ] Separate CLIP strength (off)",
                     callback: () => {
                         splitStrength = !splitStrength;
                         renderAll();
