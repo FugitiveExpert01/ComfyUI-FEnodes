@@ -150,51 +150,6 @@ The core workflow: supply the *original* reference image and tell ChromaPin whic
  
 ---
  
-### 🎬 Video Upscale With Model
- 
-> Memory-efficient upscaling of every frame in a video batch using a ComfyUI upscale model (ESRGAN, RealESRGAN, etc.).
- 
-| Parameter | Type | Description |
-|---|---|---|
-| `model_name` | upscale_models | Model from your ComfyUI `upscale_models` folder |
-| `images` | IMAGE | Input video batch `(F, H, W, C)` |
-| `upscale_method` | ENUM | Final resize filter: `nearest-exact`, `bilinear`, `area`, `bicubic` |
-| `factor` | FLOAT | Output scale multiplier (e.g. `2.0` = double resolution) |
-| `device_strategy` | ENUM | See table below |
-| `batch_size` | INT | Frames processed per GPU pass |
- 
-**Device strategies:**
- 
-| Strategy | Description |
-|---|---|
-| `auto` | Detects free VRAM and picks the best strategy automatically |
-| `keep_loaded` | Model stays on GPU — fastest, requires available VRAM |
-| `load_unload_each_frame` | Model moves to GPU per batch then back to CPU — lower peak VRAM |
-| `cpu_only` | Runs entirely on CPU — slowest, minimal VRAM usage |
- 
-**Outputs:** `upscaled_images (IMAGE)`
- 
-**Features:**
-- Automatic tiled inference via `comfy.utils.tiled_scale` — no OOM on large frames
-- `torch.no_grad()` throughout for faster inference and lower memory
-- Coloured progress bar with elapsed/ETA printed to the ComfyUI console
- 
----
- 
-### 🧹 Free Video Memory
- 
-> Pass-through node that explicitly flushes GPU memory between heavy pipeline stages.
- 
-| Parameter | Type | Description |
-|---|---|---|
-| `images` | IMAGE | Passed through unchanged |
-| `aggressive_cleanup` | ENUM | Also calls `torch.cuda.synchronize()` and allocator cache APIs if available |
-| `report_memory` | ENUM | Prints allocated/reserved GB before and after to the console |
- 
-**Outputs:** `images (IMAGE)` — identical to input
- 
----
- 
 ### 🔤 Text List → Batch / Text Batch → List
  
 Bidirectional converters between ComfyUI `LIST` and batched `STRING` types, with optional delimiter joining.
@@ -262,8 +217,6 @@ Load Video → TileSplit → [K-Sampler per tile] → TileMerge
 |---|---|---|
 | **TileSplit** | Grid tile splitting for video batches with alignment dropdown | ✅ Released (v0.0.4) |
 | **TileMerge** | Linear weighted tile reconstruction with independent feather control | ✅ Released (v0.0.4) |
-| **Video Upscale With Model** | Memory-efficient per-frame upscaling | ✅ Released |
-| **Free Video Memory** | Explicit VRAM flush between pipeline stages | ✅ Released |
 | **Text List → Batch** | LIST to batched STRING conversion | ✅ Released |
 | **Text Batch → List** | Batched STRING to LIST conversion | ✅ Released |
 | **ChromaPin** | Anchor-based colour correction across video sequences | ✅ Released (v0.0.1) |
