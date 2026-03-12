@@ -349,42 +349,50 @@ function openBrowser(anchorEl, currentFull, allLoras, onSelect) {
  
 // --- Extension registration -----------------------------------------------
  
+console.log("[FEnodes] fe_power_lora.js: module top-level executing");
+ 
 app.registerExtension({
     name: "FEnodes.PowerLoraLoad",
  
     async beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name.startsWith("FE")) {
+            console.log("[FEnodes] beforeRegisterNodeDef saw:", nodeData.name);
+        }
         if (nodeData.name !== "FELoraLoad") return;
+ 
+        console.log("[FEnodes] FELoraLoad node def found -- patching onNodeCreated");
  
         const origCreated = nodeType.prototype.onNodeCreated;
  
         nodeType.prototype.onNodeCreated = async function () {
+            console.log("[FEnodes] FELoraLoad onNodeCreated fired");
             origCreated?.apply(this, arguments);
  
             const node = this;
  
             // -- Find and hide the raw loras_json widget -----------------
             const jsonWidget = node.widgets?.find(w => w.name === "loras_json");
+            console.log("[FEnodes] loras_json widget found:", !!jsonWidget, "| widgets:", node.widgets?.map(w => w.name));
+ 
             if (jsonWidget) {
-                // Remove it from visual sizing but keep it for serialisation
-                jsonWidget.computeSize = () => [0, -4]; // -4 collapses the gap
+                jsonWidget.computeSize = () => [0, -4];
                 const origDraw = jsonWidget.draw;
                 jsonWidget.draw = () => {};
             }
  
             // -- Parse existing saved state -------------------------------
-            let loraRows = []; // [{ enabled, lora, strength_model, strength_clip }]
+            let loraRows = [];
             if (jsonWidget?.value) {
                 try { loraRows = JSON.parse(jsonWidget.value); } catch {}
             }
  
-            // Whether to show separate model / clip strengths
-            // (toggleable via node Properties panel)
             let splitStrength = false;
  
             // -- Fetch lora list async ------------------------------------
             let allLoras = [];
             getLoraList().then(list => {
                 allLoras = list;
+                console.log("[FEnodes] lora list fetched, count:", allLoras.length);
             });
  
             // -- Sync state -> hidden widget -------------------------------
@@ -518,6 +526,7 @@ app.registerExtension({
                 } catch {}
             }
  
+            console.log("[FEnodes] About to call addDOMWidget");
             // -- Add DOM widget -------------------------------------------
             node.addDOMWidget("power_loras_ui", "FEPowerLorasUI", container, {
                 getValue: () => JSON.stringify(loraRows),
