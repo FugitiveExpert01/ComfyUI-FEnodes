@@ -775,4 +775,105 @@ app.registerExtension({
             };
         };
     },
+ 
+    // -----------------------------------------------------------------------
+    // FEApplyLora -- hide optional inputs, restore from saved state,
+    // expose right-click toggles for CLIP socket and strength_scale.
+    // -----------------------------------------------------------------------
+    async beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name !== "FEApplyLora") return;
+        console.log("[FEnodes] FEApplyLora node def found -- patching");
+ 
+        const origCreated = nodeType.prototype.onNodeCreated;
+ 
+        nodeType.prototype.onNodeCreated = function () {
+            origCreated?.apply(this, arguments);
+            const node = this;
+ 
+            // -- Helper: find input by name ----------------------------------
+            function findInput(name) {
+                return node.inputs?.find(i => i.name === name);
+            }
+            function findWidget(name) {
+                return node.widgets?.find(w => w.name === name);
+            }
+ 
+            // -- Collapse the internal state widgets immediately -------------
+            // These are STRING widgets used only for persistence.
+            const wShowClip = findWidget("_fe_show_clip");
+            const wShowStr  = findWidget("_fe_show_strength");
+            if (wShowClip) { wShowClip.computeSize = () => [0, -4]; wShowClip.draw = () => {}; }
+            if (wShowStr)  { wShowStr.computeSize  = () => [0, -4]; wShowStr.draw  = () => {}; }
+ 
+            // -- Read persisted state ----------------------------------------
+            let showClip     = (wShowClip?.value === "true");
+            let showStrength = (wShowStr?.value  === "true");
+ 
+            // -- Input/widget visibility helpers -----------------------------
+            function setInputVisible(name, visible) {
+                const inp = findInput(name);
+                if (!inp) return;
+                inp.hidden = !visible;
+                // Disconnect if hiding while wired -- avoids silent state corruption
+                if (!visible && inp.link != null) {
+                    try { node.graph.removeLink(inp.link); } catch {}
+                }
+            }
+ 
+            function setWidgetVisible(name, visible) {
+                const w = findWidget(name);
+                if (!w) return;
+                if (visible) {
+                    // Restore normal sizing
+                    delete w.computeSize;
+                    delete w.draw;
+                } else {
+                    w.computeSize = () => [0, -4];
+                    w.draw = () => {};
+                }
+            }
+ 
+            // -- Apply current state -----------------------------------------
+            function applyVisibility() {
+                setInputVisible("clip", showClip);
+                setWidgetVisible("strength_scale", showStrength);
+                // Persist
+                if (wShowClip) wShowClip.value = String(showClip);
+                if (wShowStr)  wShowStr.value  = String(showStrength);
+                try {
+                    node.setSize([node.size[0], node.computeSize()[1]]);
+                    app.graph.setDirtyCanvas(true, false);
+                } catch {}
+            }
+ 
+            // Apply on creation (restores saved state on workflow load)
+            applyVisibility();
+ 
+            // -- Right-click menu toggles ------------------------------------
+            const origMenu = node.getExtraMenuOptions?.bind(node);
+            node.getExtraMenuOptions = function(_, options) {
+                origMenu?.(_, options);
+                options.push(
+                    {
+                        content: showClip
+                            ? "[x] CLIP input (on)  -- right-click to disable"
+                            : "[ ] CLIP input (off) -- right-click to enable",
+                        callback: () => {
+                            showClip = !showClip;
+                            applyVisibility();
+                        },
+                    },
+                    {
+                        content: showStrength
+                            ? "[x] Strength scale (on)  -- right-click to disable"
+                            : "[ ] Strength scale (off) -- right-click to enable",
+                        callback: () => {
+                            showStrength = !showStrength;
+                            applyVisibility();
+                        },
+                    }
+                );
+            };
+        };
+    },
 });
