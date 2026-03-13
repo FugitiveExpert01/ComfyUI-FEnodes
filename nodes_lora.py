@@ -13,7 +13,7 @@ FELoraLoad has a custom JS UI (web/js/fe_power_lora.js) providing:
   • Optional separate CLIP strength (right-click node)
 """
  
-__version__ = "0.0.8"
+__version__ = "0.0.9"
  
 import json
 import logging
@@ -416,15 +416,11 @@ class FEApplyLora:
                 "application_mode": (cls.APPLICATION_MODES, {"default": "Stack"}),
             },
             "optional": {
-                "clip":             ("CLIP",),
-                "strength_scale":   ("FLOAT", {
+                "clip":           ("CLIP",),
+                "strength_scale": ("FLOAT", {
                     "default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01,
                     "tooltip": "Global multiplier applied to all per-LoRA model and clip strengths."
                 }),
-                # Hidden state widgets — managed by JS, not shown as normal inputs.
-                # Stored as STRING so they survive workflow save/load.
-                "_fe_show_clip":     ("STRING", {"default": "false"}),
-                "_fe_show_strength": ("STRING", {"default": "false"}),
             },
         }
  
@@ -433,15 +429,14 @@ class FEApplyLora:
     FUNCTION = "apply"
     CATEGORY = "FEnodes"
     DESCRIPTION = (
-        "Applies a LoRA stack from FELoraLoad to a MODEL. "
-        "Right-click to enable optional CLIP input and/or global strength scale. "
+        "Applies a LoRA stack from FELoraLoad to a MODEL (and optionally CLIP). "
+        "strength_scale multiplies all per-LoRA strengths uniformly. "
         "Stack: sequential patching. Merge: pre-combines all deltas into one patch."
     )
  
     @classmethod
     def IS_CHANGED(cls, model, lora_stack, application_mode,
-                   clip=None, strength_scale=1.0,
-                   _fe_show_clip="false", _fe_show_strength="false"):
+                   clip=None, strength_scale=1.0):
         if not lora_stack:
             return f"empty:{application_mode}:{strength_scale}"
         parts = [application_mode, str(round(float(strength_scale), 4))]
@@ -452,8 +447,7 @@ class FEApplyLora:
         return "|".join(parts)
  
     def apply(self, model, lora_stack, application_mode,
-              clip=None, strength_scale=1.0,
-              _fe_show_clip="false", _fe_show_strength="false"):
+              clip=None, strength_scale=1.0):
         if not lora_stack:
             logger.info("[FEnodes/FEApplyLora] Empty stack — model unchanged.")
             return (model, clip)
