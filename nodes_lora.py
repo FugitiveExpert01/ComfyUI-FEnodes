@@ -13,7 +13,7 @@ FELoraLoad has a custom JS UI (web/js/fe_power_lora.js) providing:
   • Optional separate CLIP strength (right-click node)
 """
  
-__version__ = "0.0.7"
+__version__ = "0.0.8"
  
 import json
 import logging
@@ -391,7 +391,10 @@ class FEApplyLora:
     """
     Applies a FE_LORA_STACK (from FELoraLoad) to a MODEL in order.
     Architecture-agnostic: SD1, SDXL, Flux, WAN 2.1/2.2, HunyuanVideo, etc.
-    CLIP is optional.
+ 
+    Optional inputs (hidden by default, enabled via right-click menu):
+      clip           — CLIP to patch alongside the model
+      strength_scale — global multiplier applied to all per-LoRA strengths
  
     Application modes
     -----------------
@@ -413,7 +416,15 @@ class FEApplyLora:
                 "application_mode": (cls.APPLICATION_MODES, {"default": "Stack"}),
             },
             "optional": {
-                "clip": ("CLIP",),
+                "clip":             ("CLIP",),
+                "strength_scale":   ("FLOAT", {
+                    "default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01,
+                    "tooltip": "Global multiplier applied to all per-LoRA model and clip strengths."
+                }),
+                # Hidden state widgets — managed by JS, not shown as normal inputs.
+                # Stored as STRING so they survive workflow save/load.
+                "_fe_show_clip":     ("STRING", {"default": "false"}),
+                "_fe_show_strength": ("STRING", {"default": "false"}),
             },
         }
  
@@ -422,51 +433,65 @@ class FEApplyLora:
     FUNCTION = "apply"
     CATEGORY = "FEnodes"
     DESCRIPTION = (
-        "Applies a LoRA stack from FELoraLoad to a MODEL (and optionally CLIP). "
-        "Stack: sequential patching, safe with any LoRA combination. "
-        "Merge: pre-combines all deltas into one patch — best when LoRAs share target layers."
+        "Applies a LoRA stack from FELoraLoad to a MODEL. "
+        "Right-click to enable optional CLIP input and/or global strength scale. "
+        "Stack: sequential patching. Merge: pre-combines all deltas into one patch."
     )
  
     @classmethod
-    def IS_CHANGED(cls, model, lora_stack, application_mode, clip=None):
-        # Re-execute only when stack contents or application mode change.
-        # ComfyUI handles upstream re-execution automatically via the graph.
+    def IS_CHANGED(cls, model, lora_stack, application_mode,
+                   clip=None, strength_scale=1.0,
+                   _fe_show_clip="false", _fe_show_strength="false"):
         if not lora_stack:
-            return f"empty:{application_mode}"
-        parts = [application_mode]
+            return f"empty:{application_mode}:{strength_scale}"
+        parts = [application_mode, str(round(float(strength_scale), 4))]
         for entry in lora_stack:
             sm = round(float(entry.get("strength_model", 1.0)), 4)
             sc = round(float(entry.get("strength_clip",  sm)),   4)
             parts.append(f"{entry.get('name','')}:{sm}:{sc}")
         return "|".join(parts)
  
-    def apply(self, model, lora_stack, application_mode, clip=None):
+    def apply(self, model, lora_stack, application_mode,
+              clip=None, strength_scale=1.0,
+              _fe_show_clip="false", _fe_show_strength="false"):
         if not lora_stack:
             logger.info("[FEnodes/FEApplyLora] Empty stack — model unchanged.")
             return (model, clip)
  
+        scale = float(strength_scale)
+        if scale != 1.0:
+            logger.info(f"[FEnodes/FEApplyLora] Applying global strength_scale={scale}")
+ 
         if application_mode == "Merge":
             logger.info(
                 f"[FEnodes/FEApplyLora] Merge mode — combining "
-                f"{len(lora_stack)} LoRA(s) into one patch."
+                f"{len(lora_stack)} LoRA(s) into one patch "
+                f"(strength_scale={scale})."
             )
-            merged_weights = _merge_lora_weights(lora_stack)
-            # Strengths are already baked into merged_weights; apply at 1.0.
+            # Scale a copy of the stack so the cached originals are untouched
+            scaled_stack = [
+                {**e,
+                 "strength_model": e["strength_model"] * scale,
+                 "strength_clip":  e["strength_clip"]  * scale}
+                for e in lora_stack
+            ]
+            merged_weights = _merge_lora_weights(scaled_stack)
             model, clip = comfy.sd.load_lora_for_models(
                 model, clip, merged_weights, 1.0, 1.0
             )
         else:
             # Stack mode — sequential application
             for entry in lora_stack:
+                sm = entry["strength_model"] * scale
+                sc = entry["strength_clip"]  * scale
                 logger.info(
                     f"[FEnodes/FEApplyLora] Stack: applying '{entry['name']}' "
-                    f"(model_str={entry['strength_model']}, clip_str={entry['strength_clip']})"
+                    f"(model_str={sm:.4f}, clip_str={sc:.4f})"
                 )
                 model, clip = comfy.sd.load_lora_for_models(
                     model, clip,
                     entry["weights"],
-                    entry["strength_model"],
-                    entry["strength_clip"],
+                    sm, sc,
                 )
  
         return (model, clip)
