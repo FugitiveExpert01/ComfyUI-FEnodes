@@ -13,7 +13,7 @@ FELoraLoad has a custom JS UI (web/js/fe_power_lora.js) providing:
   • Optional separate CLIP strength (right-click node)
 """
  
-__version__ = "0.0.6"
+__version__ = "0.0.7"
  
 import json
 import logging
@@ -34,6 +34,33 @@ FE_LORA_STACK = "FE_LORA_STACK"
 # FELoraLoad nodes or tile streams are only read from disk once.
 # ---------------------------------------------------------------------------
 _lora_weight_cache: dict[str, dict] = {}
+ 
+# ---------------------------------------------------------------------------
+# IS_CHANGED hash cache
+# Maps lora_path -> (mtime, sha256_hex) so IS_CHANGED never reads a file
+# twice unless it has actually been modified on disk.
+# ---------------------------------------------------------------------------
+_hash_cache: dict[str, tuple[float, str]] = {}
+ 
+def _cached_file_hash(path: str) -> str:
+    """Return SHA256 hex for path, recomputing only when mtime changes."""
+    import os, hashlib
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return path  # file missing — use path as sentinel
+ 
+    cached = _hash_cache.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+ 
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(131072), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    _hash_cache[path] = (mtime, digest)
+    return digest
  
 # ---------------------------------------------------------------------------
 # API routes
@@ -211,16 +238,18 @@ class FELoraLoad:
         except Exception:
             return loras_json
  
-        hashes = []
+        parts = []
         for entry in entries:
             if not entry.get("enabled", True) or not entry.get("lora"):
                 continue
-            path = folder_paths.get_full_path("loras", entry["lora"])
-            if path:
-                hashes.append(comfy.utils.calculate_file_hash(path))
-            else:
-                hashes.append(entry["lora"])
-        return str(hashes) + loras_json
+            lora_name = entry["lora"]
+            path = folder_paths.get_full_path("loras", lora_name)
+            file_hash = _cached_file_hash(path) if path else lora_name
+            # Normalise strengths to 4dp to avoid float serialisation jitter
+            sm = round(float(entry.get("strength_model", 1.0)), 4)
+            sc = round(float(entry.get("strength_clip",  sm)),   4)
+            parts.append(f"{lora_name}:{file_hash}:{sm}:{sc}")
+        return "|".join(parts)
  
     def load(self, loras_json):
         try:
@@ -397,6 +426,19 @@ class FEApplyLora:
         "Stack: sequential patching, safe with any LoRA combination. "
         "Merge: pre-combines all deltas into one patch — best when LoRAs share target layers."
     )
+ 
+    @classmethod
+    def IS_CHANGED(cls, model, lora_stack, application_mode, clip=None):
+        # Re-execute only when stack contents or application mode change.
+        # ComfyUI handles upstream re-execution automatically via the graph.
+        if not lora_stack:
+            return f"empty:{application_mode}"
+        parts = [application_mode]
+        for entry in lora_stack:
+            sm = round(float(entry.get("strength_model", 1.0)), 4)
+            sc = round(float(entry.get("strength_clip",  sm)),   4)
+            parts.append(f"{entry.get('name','')}:{sm}:{sc}")
+        return "|".join(parts)
  
     def apply(self, model, lora_stack, application_mode, clip=None):
         if not lora_stack:
@@ -823,4 +865,3 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FEApplyLora":           "Apply LoRA ⚡",
     "FELoraTriggerAnalysis": "LoRA Trigger Analysis 🔍",
 }
- 
