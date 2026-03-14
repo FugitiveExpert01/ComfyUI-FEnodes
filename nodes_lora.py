@@ -13,7 +13,7 @@ FELoraLoad has a custom JS UI (web/js/fe_power_lora.js) providing:
   • Optional separate CLIP strength (right-click node)
 """
  
-__version__ = "0.0.9"
+__version__ = "0.1.0"
  
 import json
 import logging
@@ -412,10 +412,10 @@ class FEApplyLora:
         return {
             "required": {
                 "model":            ("MODEL",),
-                "lora_stack":       (FE_LORA_STACK,),
                 "application_mode": (cls.APPLICATION_MODES, {"default": "Stack"}),
             },
             "optional": {
+                "lora_stack":     (FE_LORA_STACK,),
                 "clip":           ("CLIP",),
                 "strength_scale": ("FLOAT", {
                     "default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01,
