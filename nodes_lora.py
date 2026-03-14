@@ -435,7 +435,7 @@ class FEApplyLora:
     )
  
     @classmethod
-    def IS_CHANGED(cls, model, lora_stack, application_mode,
+    def IS_CHANGED(cls, model, application_mode, lora_stack=None,
                    clip=None, strength_scale=1.0):
         if not lora_stack:
             return f"empty:{application_mode}:{strength_scale}"
@@ -446,7 +446,7 @@ class FEApplyLora:
             parts.append(f"{entry.get('name','')}:{sm}:{sc}")
         return "|".join(parts)
  
-    def apply(self, model, lora_stack, application_mode,
+    def apply(self, model, application_mode, lora_stack=None,
               clip=None, strength_scale=1.0):
         if not lora_stack:
             logger.info("[FEnodes/FEApplyLora] Empty stack — model unchanged.")
