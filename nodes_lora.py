@@ -13,7 +13,7 @@ FELoraLoad has a custom JS UI (web/js/fe_power_lora.js) providing:
   • Optional separate CLIP strength (right-click node)
 """
  
-__version__ = "0.1.0"
+__version__ = "0.1.1"
  
 import json
 import logging
@@ -316,28 +316,49 @@ def _merge_lora_weights(lora_stack: list) -> dict:
     Mathematical guarantee:
         combined_up @ combined_down = Σ strength_i * alpha_scale_i * (up_i @ down_i)
  
-    This preserves the lora_down / lora_up format that comfy.sd.load_lora_for_models
-    expects, so the merged dict can be applied in a single patcher call at
-    strength_model=1.0 / strength_clip=1.0.
+    Handles both naming conventions transparently:
+        Kohya-style:  .lora_down.weight / .lora_up.weight
+        Diffusers:    .lora_A.weight    / .lora_B.weight   (e.g. SD Turbo, SDXL Turbo)
+ 
+    Both are normalised internally and output as lora_down/up, which
+    comfy.sd.load_lora_for_models accepts for all architectures.
  
     Layers that appear in only one LoRA pass through unchanged (no concat overhead).
     Layers where ranks differ (shape mismatch) fall back gracefully with a warning.
     """
     staging: dict = {}  # base_key → {"downs": [], "ups": []}
  
+    # Supported (down_suffix, up_suffix) pairs in priority order.
+    # We try lora_down first; if absent we try lora_A.
+    _PAIRS = [
+        (".lora_down.weight", ".lora_up.weight"),
+        (".lora_A.weight",    ".lora_B.weight"),
+    ]
+ 
     for entry in lora_stack:
         weights        = entry["weights"]
         strength_model = entry["strength_model"]
         strength_clip  = entry["strength_clip"]
  
-        for down_key in (k for k in weights if k.endswith(".lora_down.weight")):
-            base_key = down_key[: -len(".lora_down.weight")]
-            up_key   = base_key + ".lora_up.weight"
-            if up_key not in weights:
-                continue
+        # Build a set of base keys present in this LoRA, regardless of convention.
+        base_keys = set()
+        for down_sfx, _ in _PAIRS:
+            for k in weights:
+                if k.endswith(down_sfx):
+                    base_keys.add(k[: -len(down_sfx)])
  
-            down = weights[down_key].float()
-            up   = weights[up_key].float()
+        for base_key in base_keys:
+            # Find which convention this layer uses
+            down, up = None, None
+            for down_sfx, up_sfx in _PAIRS:
+                dk = base_key + down_sfx
+                uk = base_key + up_sfx
+                if dk in weights and uk in weights:
+                    down = weights[dk].float()
+                    up   = weights[uk].float()
+                    break
+            if down is None:
+                continue
  
             # Alpha scale: alpha/rank if present, else 1.0
             alpha_key   = base_key + ".alpha"
@@ -345,13 +366,11 @@ def _merge_lora_weights(lora_stack: list) -> dict:
             alpha_scale = float(weights[alpha_key]) / rank if alpha_key in weights else 1.0
  
             # Text-encoder keys use strength_clip; everything else strength_model.
-            # Covers all major training conventions (Kohya SD1/SDXL/Flux, SimpleTuner).
             is_te    = any(f in base_key for f in ("lora_te", "lora_te1", "lora_te2"))
             strength = strength_clip if is_te else strength_model
  
             # Bake strength + alpha into the matrices via sqrt-scaling so that
             # (scale*up) @ (scale*down) = strength * alpha_scale * up @ down.
-            # Sign carried on `up` so the combined product has the correct sign.
             scale = (abs(strength) * alpha_scale) ** 0.5
             sign  = 1.0 if strength >= 0 else -1.0
  
@@ -364,18 +383,15 @@ def _merge_lora_weights(lora_stack: list) -> dict:
     for base_key, parts in staging.items():
         downs, ups = parts["downs"], parts["ups"]
         if len(downs) == 1:
-            # Only one LoRA targets this layer — no concatenation needed.
             combined[base_key + ".lora_down.weight"] = downs[0]
             combined[base_key + ".lora_up.weight"]   = ups[0]
         else:
             try:
-                # Linear: down=(rank, in_features),  up=(out_features, rank)
-                # Conv:   down=(rank, in_ch, kH, kW), up=(out_ch, rank, 1, 1)
                 combined[base_key + ".lora_down.weight"] = torch.cat(downs, dim=0)
                 combined[base_key + ".lora_up.weight"]   = torch.cat(ups,   dim=1)
             except Exception as e:
                 logger.warning(
-                    f"[FEnodes/FEApplyLora] Merge: shape mismatch on '{base_key}' — "
+                    f"[FEnodes/FEApplyLora] Merge: shape mismatch on '{base_key}' -- "
                     f"falling back to first LoRA only. ({e})"
                 )
                 combined[base_key + ".lora_down.weight"] = downs[0]
