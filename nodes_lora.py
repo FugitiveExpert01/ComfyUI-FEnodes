@@ -96,10 +96,11 @@ class FELoraLoad:
             if not lora_name:
                 continue
  
-            lora_path = folder_paths.get_full_path("loras", lora_name)
-            if lora_path is None:
-                logger.warning(f"[FEnodes/FELoraLoad] LoRA not found: {lora_name}")
-                continue
+            try:
+                lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+            except FileNotFoundError as e:
+                logger.error(f"[FEnodes/FELoraLoad] {e}")
+                raise
  
             strength_model = float(entry.get("strength_model", 1.0))
             # strength_clip falls back to strength_model if not explicitly set.
