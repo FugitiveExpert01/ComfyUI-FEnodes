@@ -20,7 +20,6 @@ import folder_paths
  
 from .lora_utils import (
     FE_LORA_STACK,
-    _lora_weight_cache,
     _cached_file_hash,
     normalize_lora_name,
     merge_lora_weights,
@@ -107,16 +106,11 @@ class FELoraLoad:
             # The JS widget always writes it; fallback covers older workflows.
             strength_clip = float(entry.get("strength_clip", strength_model))
  
-            if lora_path in _lora_weight_cache:
-                logger.info(f"[FEnodes/FELoraLoad] Cache hit: '{lora_name}'")
-                weights = _lora_weight_cache[lora_path]
-            else:
-                logger.info(
-                    f"[FEnodes/FELoraLoad] Loading '{lora_name}' from disk "
-                    f"(model_str={strength_model}, clip_str={strength_clip})"
-                )
-                weights = comfy.utils.load_torch_file(lora_path, safe_load=True)
-                _lora_weight_cache[lora_path] = weights
+            logger.info(
+                f"[FEnodes/FELoraLoad] Loading '{lora_name}' "
+                f"(model_str={strength_model}, clip_str={strength_clip})"
+            )
+            weights = comfy.utils.load_torch_file(lora_path, safe_load=True)
  
             stack.append({
                 "name":           lora_name,
