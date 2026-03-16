@@ -16,6 +16,7 @@ from .lora_utils import (
     read_safetensors_metadata,
     fetch_civitai_info,
     normalize_lora_name,
+    _info_cache_path,
 )
 
 logger = logging.getLogger("FEnodes")
@@ -74,7 +75,11 @@ def register_routes():
                 logger.warning(f"[FEnodes/routes] /fenodes/lora_info: path exists in index but file missing on disk: {lora_path}")
                 return web.json_response({"error": f"File missing on disk: {lora_path}"}, status=404)
 
-            cache_path = os.path.splitext(lora_path)[0] + ".fe-info.json"
+            # Cache lives in the system temp directory, not alongside the model file.
+            # Keyed on SHA256 so it remains valid if the file is renamed or moved.
+            from .lora_utils import _sha256_full
+            file_hash = _sha256_full(lora_path)
+            cache_path = _info_cache_path(file_hash)
 
             # Serve from cache unless refresh requested
             if os.path.isfile(cache_path) and not refresh:
