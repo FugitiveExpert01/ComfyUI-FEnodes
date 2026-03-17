@@ -10,7 +10,7 @@ Ref: VACE §3.1 (V2V control signal format) / §4.1 (data construction)
      WAN 2.1 technical report (optical flow evaluation convention)
 """
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 import logging
 import os
@@ -23,10 +23,7 @@ import folder_paths
 
 log = logging.getLogger("FEnodes")
 
-# ---------------------------------------------------------------------------
-# Fallback URL in case Raft_Large_Weights.DEFAULT.url is unavailable
-# (matches torchvision's own registry as of torchvision 0.15+)
-# ---------------------------------------------------------------------------
+# Fallback URL matching torchvision's own registry (torchvision >= 0.15)
 _RAFT_LARGE_FALLBACK_URL = (
     "https://download.pytorch.org/models/raft_large_C_T_SKHT_V2-ff5fadd5.pth"
 )
@@ -40,44 +37,32 @@ _model_cache: Dict[str, object] = {}
 # ---------------------------------------------------------------------------
 
 def _raft_weights_path() -> str:
-    """Return the canonical path for RAFT Large weights inside ComfyUI models/."""
     raft_dir = os.path.join(folder_paths.models_dir, "raft")
     os.makedirs(raft_dir, exist_ok=True)
     return os.path.join(raft_dir, "raft_large.pth")
 
 
 def _download_raft_weights(dest: str) -> None:
-    """Download RAFT Large weights to *dest* using torch.hub."""
     try:
         from torchvision.models.optical_flow import Raft_Large_Weights
         url = Raft_Large_Weights.DEFAULT.url
     except AttributeError:
         url = _RAFT_LARGE_FALLBACK_URL
 
-    log.info("[FEnodes/FERaftFlow] Downloading RAFT Large weights → %s", dest)
+    log.info("[FEnodes/FERaftFlow] Downloading RAFT Large weights -> %s", dest)
     import torch.hub
     torch.hub.download_url_to_file(url, dest, progress=True)
     log.info("[FEnodes/FERaftFlow] Download complete.")
 
 
 def _load_state_dict(path: str) -> dict:
-    """Load a state_dict from *path*, compatible with PyTorch >= 1.13."""
     try:
         return torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
-        # weights_only not available in older PyTorch builds
         return torch.load(path, map_location="cpu")
 
 
 def _get_or_load_raft(device: torch.device) -> object:
-    """
-    Return a cached, eval-mode RAFT Large model on *device*.
-
-    On first call: checks for weights in {ComfyUI}/models/raft/raft_large.pth,
-    downloads if absent, loads, and caches.  Subsequent calls return the cached
-    instance; if the requested device differs from the cached model's device the
-    cache is invalidated and the model is moved.
-    """
     from torchvision.models.optical_flow import raft_large
 
     device_key = str(device)
@@ -97,7 +82,7 @@ def _get_or_load_raft(device: torch.device) -> object:
     model.eval()
     model.to(device)
 
-    _model_cache.clear()          # evict any model on a different device
+    _model_cache.clear()
     _model_cache[device_key] = model
     log.info("[FEnodes/FERaftFlow] RAFT model ready on %s.", device)
     return model
@@ -107,10 +92,21 @@ def _get_or_load_raft(device: torch.device) -> object:
 # Tensor utilities
 # ---------------------------------------------------------------------------
 
+def _to_raft_input(frames_u8: torch.Tensor) -> torch.Tensor:
+    """
+    Convert uint8 [N, 3, H, W] -> float32 [N, 3, H, W] in [-1, 1].
+
+    Replicates what Raft_Large_Weights.DEFAULT.transforms() does, as a single
+    fused GPU op.  Bypassing the transforms() callable avoids the CPU round-trip
+    and removes any version-dependent uncertainty about whether it accepts CUDA
+    tensors.
+    """
+    return frames_u8.float().div_(127.5).sub_(1.0)
+
+
 def _pad8(t: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
     """
-    Pad a [B, C, H, W] tensor so H and W are multiples of 8 (RAFT requirement).
-    Padding is applied to the bottom and right edges via replication.
+    Pad [B, C, H, W] so H and W are multiples of 8 (RAFT encoder requirement).
     Returns (padded_tensor, (pad_h, pad_w)).
     """
     _, _, h, w = t.shape
@@ -126,58 +122,49 @@ def _pad8(t: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
 # ---------------------------------------------------------------------------
 
 def _visualise_flows_global(
-    raw_flows: List[torch.Tensor],
+    flows: torch.Tensor,   # [N, 2, H, W] float32, pixel units
     H: int,
     W: int,
 ) -> torch.Tensor:
     """
-    Convert a list of [2, H, W] flow tensors to an [N, 3, H, W] uint8 RGB batch
+    Convert [N, 2, H, W] flow tensor to [N, 3, H, W] uint8 Middlebury RGB
     using torchvision's flow_to_image with *global* per-clip normalisation.
 
-    VACE training data uses a single normalisation constant (the maximum flow
-    magnitude across the entire clip) rather than per-frame normalisation.  This
-    ensures that temporal motion magnitude is encoded consistently: a slow frame
-    appears less saturated than a fast one.
+    VACE uses a single normalisation constant across the entire clip so that
+    temporal motion scale is preserved: a slow frame appears less saturated
+    than a fast one rather than being independently stretched to full saturation.
 
-    Implementation note
-    -------------------
-    torchvision.utils.flow_to_image normalises each frame independently by its
-    own maximum magnitude.  To force global normalisation we inject a reference
-    pixel (global_max, 0) at position (0, 0) for every frame.  This makes
-    flow_to_image use global_max as its rad_max, so every pixel in every frame
-    is divided by the same constant.  The reference pixel itself is painted with
-    the colour corresponding to maximum rightward motion; this single-pixel
-    artefact is inconsequential for a VACE control signal.
+    flow_to_image normalises each frame by its own local max.  To override
+    this we inject a reference pixel (global_max, 0) at position (0, 0) across
+    all frames simultaneously, forcing flow_to_image to use global_max as its
+    rad_max for every frame.  The reference pixel itself receives the colour for
+    maximum rightward motion — a single-pixel artefact negligible for a VACE
+    control signal.
+
+    Called once on the full [N, 2, H, W] stack rather than per-frame.
     """
     from torchvision.utils import flow_to_image
 
-    eps = 1e-7
-    all_flows = torch.stack(raw_flows, dim=0)          # [N, 2, H, W]
-    magnitudes = (all_flows[:, 0] ** 2 + all_flows[:, 1] ** 2).sqrt()
+    eps  = 1e-7
+    N    = flows.shape[0]
+
+    magnitudes = (flows[:, 0] ** 2 + flows[:, 1] ** 2).sqrt()
     global_max = float(magnitudes.max().item())
 
     log.info(
-        "[FEnodes/FERaftFlow] Global max flow magnitude: %.3f px  (clip: %d frames)",
-        global_max, len(raw_flows),
+        "[FEnodes/FERaftFlow] Global max magnitude: %.3f px  (%d pairs)",
+        global_max, N,
     )
 
-    rgb_frames: List[torch.Tensor] = []
+    if global_max > eps:
+        flows_adj = flows.clone()
+        flows_adj[:, 0, 0, 0] = global_max   # broadcast reference pixel to all frames
+        flows_adj[:, 1, 0, 0] = 0.0
+        rgb = flow_to_image(flows_adj)        # [N, 3, H, W] uint8 — single call
+    else:
+        rgb = torch.zeros(N, 3, H, W, dtype=torch.uint8, device=flows.device)
 
-    for flow in raw_flows:  # flow: [2, H, W]
-        if global_max > eps:
-            # Inject reference pixel so flow_to_image normalises by global_max
-            flow_adj = flow.clone()
-            flow_adj[0, 0, 0] = global_max
-            flow_adj[1, 0, 0] = 0.0
-            # flow_to_image accepts [2, H, W] or [N, 2, H, W]; pass with batch dim
-            rgb = flow_to_image(flow_adj.unsqueeze(0)).squeeze(0)  # [3, H, W] uint8
-        else:
-            # Fully static clip — return black frames
-            rgb = torch.zeros(3, H, W, dtype=torch.uint8, device=flow.device)
-
-        rgb_frames.append(rgb)
-
-    return torch.stack(rgb_frames, dim=0)   # [N, 3, H, W] uint8
+    return rgb
 
 
 # ---------------------------------------------------------------------------
@@ -188,14 +175,17 @@ class FERaftFlow:
     """
     Generate a dense optical flow RGB video using RAFT Large.
 
-    • Input  : IMAGE batch [N, H, W, 3] float32 [0, 1]  (N ≥ 2)
-    • Output : IMAGE batch [N-1, H, W, 3] float32 [0, 1]
+    Input  : IMAGE batch [N, H, W, 3] float32 [0, 1]  (N >= 2)
+    Output : IMAGE batch [N-1, H, W, 3] float32 [0, 1]
 
-    The output is encoded using the Middlebury colour-wheel convention
-    (hue = direction, saturation = magnitude, value = 1.0) and normalised
-    per-clip (single global maximum), matching the format used to construct
-    VACE training data (VACE §4.1).  It can be passed directly to a VACE V2V
-    conditioning node or saved as a video via VHS Save Video.
+    Encoding uses the Middlebury colour-wheel convention (hue = direction,
+    saturation = magnitude, value = 1.0) with per-clip global normalisation,
+    matching the VACE training data format (VACE ss4.1).
+
+    Processing is GPU-accelerated throughout:
+    - Input conversion and padding performed once on the full clip.
+    - Frame pairs batched through RAFT in configurable chunks.
+    - flow_to_image called once on the full flow stack.
 
     Weights are stored in {ComfyUI}/models/raft/raft_large.pth and downloaded
     automatically on first use.
@@ -211,9 +201,9 @@ class FERaftFlow:
         "Computes dense optical flow between consecutive frame pairs using "
         "RAFT Large (torchvision) and returns a Middlebury-coded RGB video "
         "compatible with VACE V2V control signal inputs.  "
-        "Flow is normalised per-clip (global max) to match VACE training "
-        "conventions.  Weights download automatically to "
-        "{ComfyUI}/models/raft/raft_large.pth on first use."
+        "Per-clip global normalisation matches VACE training conventions.  "
+        "Fully GPU-accelerated with configurable batch chunking.  "
+        "Weights download automatically to {ComfyUI}/models/raft/raft_large.pth."
     )
 
     @classmethod
@@ -222,8 +212,8 @@ class FERaftFlow:
             "required": {
                 "images": ("IMAGE", {
                     "tooltip": (
-                        "Source video or image sequence decoded by an upstream loader "
-                        "(e.g. VHS LoadVideo).  Must contain at least 2 frames.  "
+                        "Source video frames from an upstream loader "
+                        "(e.g. VHS LoadVideo).  Minimum 2 frames.  "
                         "Shape: [N, H, W, 3] float32 [0, 1]."
                     ),
                 }),
@@ -233,9 +223,19 @@ class FERaftFlow:
                     "max":     32,
                     "step":     1,
                     "tooltip": (
-                        "RAFT refinement iterations.  Higher values produce more "
-                        "accurate flow at the cost of compute.  "
-                        "20 is the default used in the original RAFT paper."
+                        "RAFT refinement iterations.  Higher = more accurate "
+                        "flow at greater compute cost.  "
+                        "20 is the standard RAFT paper default."
+                    ),
+                }),
+                "chunk_size": ("INT", {
+                    "default":  4,
+                    "min":      1,
+                    "max":     64,
+                    "step":     1,
+                    "tooltip": (
+                        "Frame pairs per RAFT forward call.  Higher = faster "
+                        "but more VRAM.  Reduce if you hit OOM on long clips."
                     ),
                 }),
             },
@@ -249,10 +249,9 @@ class FERaftFlow:
         self,
         images: torch.Tensor,
         iters: int,
+        chunk_size: int,
         unique_id: Optional[str] = None,
     ) -> Tuple[torch.Tensor]:
-
-        from torchvision.models.optical_flow import Raft_Large_Weights
 
         N, H, W, C = images.shape
 
@@ -261,76 +260,74 @@ class FERaftFlow:
                 f"[FEnodes/FERaftFlow] At least 2 frames required, got {N}."
             )
 
-        device = images.device
+        n_pairs = N - 1
+        device  = images.device
+
         log.info(
-            "[FEnodes/FERaftFlow] %d frame pairs | %d×%d | iters=%d | device=%s",
-            N - 1, H, W, iters, device,
+            "[FEnodes/FERaftFlow] %d pairs | %dx%d | iters=%d | chunk=%d | device=%s",
+            n_pairs, H, W, iters, chunk_size, device,
         )
 
         # ---- Load / retrieve cached model --------------------------------
-        model   = _get_or_load_raft(device)
-        transforms = Raft_Large_Weights.DEFAULT.transforms()
+        model = _get_or_load_raft(device)
 
-        # ---- Convert input to uint8 [N, 3, H, W] for torchvision --------
-        # RAFT's torchvision transforms expect uint8 [B, 3, H, W].
-        # ComfyUI IMAGE convention is float32 [0, 1] → ×255 → uint8.
-        frames_chw = (
-            images.permute(0, 3, 1, 2)   # [N, H, W, 3] → [N, 3, H, W]
+        # ---- Build RAFT input tensor — once for the whole clip -----------
+        #
+        # ComfyUI IMAGE: float32 [N, H, W, 3] [0, 1]
+        #   → permute  → [N, 3, H, W]
+        #   → uint8    (×255, clamp)
+        #   → float32  (÷127.5 − 1.0, i.e. [-1, 1])
+        #   → pad H,W to multiples of 8
+        #
+        # Everything stays on `device`.  The intermediate uint8 is transient;
+        # _to_raft_input uses in-place ops so it does not double the allocation.
+        frames_chw  = (
+            images.permute(0, 3, 1, 2)
             .mul(255.0)
             .clamp(0, 255)
             .to(torch.uint8)
         )
+        frames_raft         = _to_raft_input(frames_chw)   # [N, 3, H, W] float32
+        del frames_chw                                      # free uint8 copy
 
-        # ---- Compute raw flows for every consecutive pair ----------------
-        raw_flows: List[torch.Tensor] = []
+        frames_pad, (ph, pw) = _pad8(frames_raft)          # [N, 3, H', W']
+        del frames_raft                                     # free unpadded copy
+
+        # ---- Chunked batched RAFT inference ------------------------------
+        all_flows: List[torch.Tensor] = []
 
         with torch.no_grad():
-            for i in range(N - 1):
-                # [1, 3, H, W] uint8
-                f1 = frames_chw[i    ].unsqueeze(0)
-                f2 = frames_chw[i + 1].unsqueeze(0)
+            for start in range(0, n_pairs, chunk_size):
+                end = min(start + chunk_size, n_pairs)
 
-                # Apply RAFT pre-processing transforms (uint8 → float, [-1, 1])
-                # Transforms are lightweight tensor ops; keep on CPU, then move.
-                f1_t, f2_t = transforms(f1.cpu(), f2.cpu())
-                f1_t = f1_t.to(device)
-                f2_t = f2_t.to(device)
+                b1 = frames_pad[start : end]       # [B, 3, H', W']
+                b2 = frames_pad[start + 1 : end + 1]
 
-                # Pad H and W to multiples of 8 (hard requirement of RAFT's
-                # feature encoder downsampling path)
-                f1_pad, (ph, pw) = _pad8(f1_t)
-                f2_pad, _         = _pad8(f2_t)
+                flow_list  = model(b1, b2, num_flow_updates=iters)
+                flow_crop  = flow_list[-1][:, :, :H, :W]   # [B, 2, H, W]
+                all_flows.append(flow_crop)
 
-                # Forward — returns a list of progressively refined [B, 2, H, W] flows
-                flow_list = model(f1_pad, f2_pad, num_flow_updates=iters)
+        del frames_pad
 
-                # Take the final (most refined) prediction and crop padding
-                flow = flow_list[-1][:, :, :H, :W]   # [1, 2, H, W] px units
-                raw_flows.append(flow.squeeze(0))      # → [2, H, W]
+        # Concatenate chunks → [N-1, 2, H, W]
+        flows = torch.cat(all_flows, dim=0)
+        del all_flows
 
-        # ---- Global per-clip normalisation + Middlebury colour encoding --
-        rgb_batch = _visualise_flows_global(raw_flows, H, W)  # [N-1, 3, H, W] uint8
+        # ---- Global normalisation + Middlebury colour encoding -----------
+        # Single call on the full flow stack — no per-frame loop
+        rgb = _visualise_flows_global(flows, H, W)   # [N-1, 3, H, W] uint8
+        del flows
 
-        # ---- Convert to ComfyUI IMAGE convention  [N-1, H, W, 3] float32 [0,1]
-        out = (
-            rgb_batch
-            .permute(0, 2, 3, 1)   # [N-1, 3, H, W] → [N-1, H, W, 3]
-            .to(torch.float32)
-            .div(255.0)
-        )
+        # ---- Convert to ComfyUI IMAGE convention -------------------------
+        out = rgb.permute(0, 2, 3, 1).float().div(255.0)   # [N-1, H, W, 3]
+        del rgb
 
         log.info(
-            "[FEnodes/FERaftFlow] Done. Output: %s, dtype=%s.",
+            "[FEnodes/FERaftFlow] Done. Output: %s dtype=%s.",
             tuple(out.shape), out.dtype,
         )
 
-        # ---- Optional node-footer status text ---------------------------
-        self._send_footer(
-            unique_id,
-            n_pairs=N - 1,
-            h=H,
-            w=W,
-        )
+        self._send_footer(unique_id, n_pairs=n_pairs, h=H, w=W)
 
         return (out,)
 
@@ -346,7 +343,7 @@ class FERaftFlow:
             return
         try:
             from server import PromptServer
-            msg = f"{n_pairs} flow frames  |  {w}×{h}"
+            msg = f"{n_pairs} flow frames  |  {w}x{h}"
             PromptServer.instance.send_sync(
                 "fe_progress_text",
                 {"node_id": unique_id, "text": msg},
