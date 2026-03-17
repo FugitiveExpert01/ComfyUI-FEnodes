@@ -37,6 +37,14 @@ except Exception as e:
     logging.warning(f"[FEnodes] Failed to load LoRA nodes: {e}")
     _LORA_CLASSES = {}
     _LORA_NAMES = {}
+
+try:
+    from .nodes_raft_flow import NODE_CLASS_MAPPINGS as _RAFT_CLASSES
+    from .nodes_raft_flow import NODE_DISPLAY_NAME_MAPPINGS as _RAFT_NAMES
+except Exception as e:
+    logging.warning(f"[FEnodes] Failed to load RAFT Flow nodes: {e}")
+    _RAFT_CLASSES = {}
+    _RAFT_NAMES = {}
  
 try:
     from .routes import register_routes
@@ -49,6 +57,7 @@ NODE_CLASS_MAPPINGS = {
     **_TEXT_CLASSES,
     **_COLOR_CLASSES,
     **_LORA_CLASSES,
+    **_RAFT_CLASSES,
 }
  
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -56,6 +65,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     **_TEXT_NAMES,
     **_COLOR_NAMES,
     **_LORA_NAMES,
+    **_RAFT_NAMES,
 }
  
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
