@@ -7,7 +7,7 @@ Version: v0.0.6
 __version__ = "v0.0.6"
  
 import math
-import logging
+ 
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -83,14 +83,16 @@ class TileSplit(TilingNodeBase):
                 "image":           ("IMAGE",),
                 "use_pixel_size":  ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Switch between grid mode (tiles_x / tiles_y) and pixel size mode (tile_width / tile_height).",
+                    "tooltip": (
+                        "OFF: tiles_x / tiles_y define the grid count. "
+                        "ON: tiles_x / tiles_y are reinterpreted as target tile width / height in pixels "
+                        "and the grid is derived automatically via ceil(canvas / tile_px)."
+                    ),
                 }),
-                "tiles_x":         ("INT",   {"default": 2,    "min": 1,   "max": 10}),
-                "tiles_y":         ("INT",   {"default": 2,    "min": 1,   "max": 10}),
-                "tile_width":      ("INT",   {"default": 768,  "min": 64,  "max": 8192, "step": 8,
-                    "tooltip": "Target tile width in pixels. Grid is derived via ceil(canvas / tile_px). Only active when use_pixel_size is enabled."}),
-                "tile_height":     ("INT",   {"default": 768,  "min": 64,  "max": 8192, "step": 8,
-                    "tooltip": "Target tile height in pixels. Grid is derived via ceil(canvas / tile_px). Only active when use_pixel_size is enabled."}),
+                "tiles_x":         ("INT", {"default": 2, "min": 1, "max": 8192, "step": 1,
+                    "tooltip": "Grid mode: number of columns. Pixel mode: target tile width in pixels."}),
+                "tiles_y":         ("INT", {"default": 2, "min": 1, "max": 8192, "step": 1,
+                    "tooltip": "Grid mode: number of rows. Pixel mode: target tile height in pixels."}),
                 "overlap_percent": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 0.5, "step": 0.01}),
                 "alignment": (ALIGNMENT_OPTIONS, {
                     "default": "Free",
@@ -113,7 +115,7 @@ class TileSplit(TilingNodeBase):
     FUNCTION       = "split"
     CATEGORY       = "FEnodes"
  
-    def split(self, image, use_pixel_size, tiles_x, tiles_y, tile_width, tile_height, overlap_percent, alignment="Free", unique_id=None):
+    def split(self, image, use_pixel_size, tiles_x, tiles_y, overlap_percent, alignment="Free", unique_id=None):
         B, H, W, C = image.shape
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
  
@@ -122,15 +124,15 @@ class TileSplit(TilingNodeBase):
  
         # ── Grid resolution ──────────────────────────────────────────────────
         if use_pixel_size:
-            tiles_x = max(1, math.ceil(W / tile_width))
-            tiles_y = max(1, math.ceil(H / tile_height))
+            # tiles_x / tiles_y are pixel dimensions in this mode
+            tiles_x = max(1, math.ceil(W / tiles_x))
+            tiles_y = max(1, math.ceil(H / tiles_y))
  
         stride_w = W / tiles_x
         stride_h = H / tiles_y
  
-        # overlap_percent is a fraction of the full canvas, so the safe upper
-        # limit is 1/tiles (beyond that the overlap zone exceeds one stride and
-        # pixels get triple-covered).
+        # overlap_percent is a fraction of the full canvas — safe upper limit
+        # is 1/tiles (beyond that the overlap zone exceeds one stride).
         max_overlap = 1.0 / max(tiles_x, tiles_y)
         if overlap_percent > max_overlap:
             print(
@@ -327,3 +329,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TileSplit": "TileSplit",
     "TileMerge": "TileMerge",
 }
+ 
