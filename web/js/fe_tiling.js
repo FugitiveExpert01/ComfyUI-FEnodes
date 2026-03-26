@@ -1,22 +1,10 @@
 import { app } from "../../../scripts/app.js";
  
-function hideWidget(node, widget) {
-    if (widget.__fe_hidden) return;
-    widget.__fe_hidden      = true;
-    widget.__fe_origType    = widget.type;
-    widget.__fe_origCompute = widget.computeSize;
-    widget.type             = "tschide";
-    widget.computeSize      = () => [0, -4];
-    node.setSize(node.computeSize());
-}
+const GRID_DEFAULTS  = { tiles_x: 2,   tiles_y: 2   };
+const PIXEL_DEFAULTS = { tiles_x: 768, tiles_y: 768 };
  
-function showWidget(node, widget) {
-    if (!widget.__fe_hidden) return;
-    widget.__fe_hidden = false;
-    widget.type        = widget.__fe_origType;
-    widget.computeSize = widget.__fe_origCompute || undefined;
-    node.setSize(node.computeSize());
-}
+const GRID_LABELS  = { tiles_x: "tiles_x",    tiles_y: "tiles_y"     };
+const PIXEL_LABELS = { tiles_x: "tile_width",  tiles_y: "tile_height" };
  
 app.registerExtension({
     name: "FEnodes.TileSplit",
@@ -27,27 +15,28 @@ app.registerExtension({
         const usePixelWidget = node.widgets?.find(w => w.name === "use_pixel_size");
         const tilesXWidget   = node.widgets?.find(w => w.name === "tiles_x");
         const tilesYWidget   = node.widgets?.find(w => w.name === "tiles_y");
-        const tileWWidget    = node.widgets?.find(w => w.name === "tile_width");
-        const tileHWidget    = node.widgets?.find(w => w.name === "tile_height");
  
-        if (!usePixelWidget || !tilesXWidget || !tilesYWidget || !tileWWidget || !tileHWidget) return;
+        if (!usePixelWidget || !tilesXWidget || !tilesYWidget) return;
  
-        function updateVisibility() {
-            const usePixel = usePixelWidget.value;
-            if (usePixel) {
-                hideWidget(node, tilesXWidget);
-                hideWidget(node, tilesYWidget);
-                showWidget(node, tileWWidget);
-                showWidget(node, tileHWidget);
-            } else {
-                showWidget(node, tilesXWidget);
-                showWidget(node, tilesYWidget);
-                hideWidget(node, tileWWidget);
-                hideWidget(node, tileHWidget);
+        function updateLabels(usePixel, resetValues) {
+            const labels   = usePixel ? PIXEL_LABELS   : GRID_LABELS;
+            const defaults = usePixel ? PIXEL_DEFAULTS : GRID_DEFAULTS;
+ 
+            tilesXWidget.label = labels.tiles_x;
+            tilesYWidget.label = labels.tiles_y;
+ 
+            if (resetValues) {
+                tilesXWidget.value = defaults.tiles_x;
+                tilesYWidget.value = defaults.tiles_y;
             }
+ 
+            node.setDirtyCanvas(true, true);
         }
  
-        usePixelWidget.callback = updateVisibility;
-        updateVisibility();
+        // On toggle: rename and reset values
+        usePixelWidget.callback = (value) => updateLabels(value, true);
+ 
+        // On load: rename only, preserve saved values
+        updateLabels(usePixelWidget.value, false);
     },
 });
