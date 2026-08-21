@@ -18,6 +18,6 @@ Repository = "https://github.com/FugitiveExpert01/ComfyUI-FEnodes"
 "Bug Tracker" = "https://github.com/FugitiveExpert01/ComfyUI-FEnodes/issues"
 
 [tool.comfy]
-PublisherId = "FugitiveExpert01"
-DisplayName = "FEnodes"
+PublisherId = "latentiq"
+DisplayName = "latentiq"
 requires-comfyui = ">=1.0.0"
